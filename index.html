@@ -1,0 +1,1710 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="go">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GKT 对弈</title>
+<style>
+  :root, html[data-theme="go"] {
+    --bg: #f6eee9;
+    --panel: #fffaf7;
+    --border: #e3c9bc;
+    --text: #2c221f;
+    --muted: #8f7468;
+    --accent: #a33a3a;
+    --wood: #e39b6a;
+    --line: #5c3228;
+    --edge: #9a5a44;
+    --star: #7a4030;
+    --mark: #c0392b;
+    --btn: #a33a3a;
+    --btn-hover: #862e2e;
+    --danger: #7a1f1f;
+    --status-bg: #f8eee8;
+    --player-bg: #faf3ee;
+    --secondary: #f0e0d6;
+    --secondary-hover: #e6d0c4;
+    --input-hover: #f7efe9;
+    --disabled: #d4c4ba;
+  }
+  html[data-theme="gomoku"] {
+    --bg: #eef3ee;
+    --panel: #f7fbf7;
+    --border: #c5d4c6;
+    --text: #222b24;
+    --muted: #6e7a70;
+    --accent: #2e6d4f;
+    --wood: #c5cc78;
+    --line: #2a3a28;
+    --edge: #5a7a54;
+    --star: #4a6345;
+    --mark: #c0392b;
+    --btn: #2e6d4f;
+    --btn-hover: #24573f;
+    --danger: #a33a3a;
+    --status-bg: #eef5ef;
+    --player-bg: #f3f8f4;
+    --secondary: #dce8de;
+    --secondary-hover: #cddccd;
+    --input-hover: #eef5ef;
+    --disabled: #c4cfc6;
+  }
+  html[data-theme="antigomoku"] {
+    --bg: #eeedf6;
+    --panel: #f6f5fc;
+    --border: #c5c0dc;
+    --text: #221e32;
+    --muted: #6e6890;
+    --accent: #5b47b8;
+    --wood: #b4acd4;
+    --line: #3a3260;
+    --edge: #6a5fa0;
+    --star: #564a8a;
+    --mark: #7c3aed;
+    --btn: #5b47b8;
+    --btn-hover: #49389a;
+    --danger: #a33a3a;
+    --status-bg: #eeedf6;
+    --player-bg: #f2f1fa;
+    --secondary: #ddd8ee;
+    --secondary-hover: #cec8e4;
+    --input-hover: #eeedf6;
+    --disabled: #c8c4d6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh;
+  }
+  h1 { font-size: 17px; margin: 0; }
+  label { font-size: 12px; color: var(--muted); display: block; margin: 0 0 4px; }
+  select, input[type=number], button.btnLoad {
+    width: 100%; padding: 7px 8px; border: 1px solid var(--border);
+    border-radius: 6px; font-size: 14px; background: var(--panel); color: var(--text);
+  }
+  button.btnLoad:hover { background: var(--input-hover); }
+  input[type=number]:disabled { background: var(--status-bg); color: var(--muted); }
+  .row { display: flex; gap: 8px; }
+  .row > div { flex: 1; }
+  button {
+    padding: 9px 12px; border: none; border-radius: 6px; cursor: pointer;
+    font-size: 14px; background: var(--btn); color: #fff; transition: background .15s;
+  }
+  button:hover { background: var(--btn-hover); }
+  button:disabled { background: var(--disabled); cursor: not-allowed; }
+  button.secondary { background: var(--secondary); color: var(--text); }
+  button.secondary:hover { background: var(--secondary-hover); }
+
+  /* top bar */
+  #topbar {
+    flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 14px; background: var(--panel); border-bottom: 2px solid var(--accent);
+    gap: 10px;
+  }
+  .brand { font-weight: 600; font-size: 14px; }
+  .topBtns { display: flex; gap: 8px; align-items: center; }
+  .topBtns button { padding: 7px 12px; font-size: 13px; }
+
+  /* play area: sidebar (Pass + status) | board — board can use full height */
+  #main {
+    flex: 1; min-height: 0; display: flex; flex-direction: row; align-items: stretch;
+    gap: 12px; padding: 10px 12px; overflow: hidden;
+  }
+  #sidePanel {
+    flex: 0 0 240px; width: 240px; min-height: 0;
+    display: flex; flex-direction: column; gap: 10px; overflow-y: auto;
+  }
+  #boardWrap {
+    flex: 1; min-width: 0; min-height: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px;
+  }
+  #passBar { display: flex; flex-direction: column; gap: 8px; }
+  #passBar > button { padding: 10px 16px; width: 100%; }
+  #cubicMoveRow { display: none; gap: 8px; }
+  #cubicMoveRow button { flex: 1; padding: 10px 12px; width: auto; }
+  #cubicCoordBar {
+    display: none; flex: 0 0 auto; align-items: center; justify-content: center;
+    gap: 14px; font-size: 13px;
+  }
+  #cubicCoordBar label { display: flex; align-items: center; gap: 6px; color: var(--text); }
+  #cubicCoordBar input { width: 64px; padding: 4px 6px; }
+  canvas { background: var(--wood); border-radius: 8px; box-shadow: 0 2px 14px rgba(0,0,0,.18);
+           max-width: 100%; max-height: 100%; }
+  #status {
+    font-size: 13px; background: var(--status-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 12px; line-height: 1.5;
+  }
+  #status .strong { font-weight: 600; }
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.5; }
+
+  /* setup overlay (fullscreen when open) */
+  #setupOverlay {
+    position: fixed; inset: 0; z-index: 100; background: var(--bg);
+    overflow-y: auto;
+  }
+  #setupOverlay.hidden { display: none; }
+  #setupPanel {
+    max-width: 760px; margin: 20px auto; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 12px; padding: 20px;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .setupHead { display: flex; justify-content: space-between; align-items: center; }
+  .setupHead button { padding: 7px 14px; }
+  .setupRow { display: flex; gap: 12px; }
+  .setupRow > div { flex: 1; }
+  #playerGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+  /* player config card */
+  .playerRow { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+               background: var(--player-bg); }
+  .playerHead { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+  .modelBox { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 8px; }
+  .modelBox .row { margin-bottom: 6px; }
+  .modelName { font-size: 11px; color: var(--muted); display: block; margin-top: 6px; word-break: break-all; }
+  #reviewBar { display: none; flex-direction: column; gap: 6px; }
+  #reviewBar .ovRow { display: flex; gap: 6px; }
+  #reviewBar .ovRow button { flex: 1; padding: 7px 6px; font-size: 12px; }
+  #reviewBar button.ovOn { background: var(--btn); color: #fff; }
+  #reviewBar button.ovOn:hover { background: var(--btn-hover); }
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <span class="brand" id="brand">GKT · 图围棋</span>
+    <div class="topBtns">
+      <button id="btnSetup" class="secondary">⚙ 设置</button>
+      <button id="btnAuto" class="secondary">自动播放</button>
+      <button id="btnReplay" class="secondary">回放</button>
+      <span id="replayCtl" style="display:none">
+        <button id="btnPrev" class="secondary">上一步</button>
+        <button id="btnNext" class="secondary">下一步</button>
+      </span>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="sidePanel">
+      <div id="passBar" class="controls">
+        <button id="btnPass" class="secondary">Pass</button>
+        <div id="cubicMoveRow">
+          <button id="btnConfirm" class="secondary" disabled>Confirm</button>
+          <button id="btnCancel" class="secondary" disabled>Cancel</button>
+        </div>
+      </div>
+      <div id="reviewBar">
+        <label>AI 着法分析</label>
+        <div class="ovRow">
+          <button id="btnOvOff" class="secondary ovOn">关</button>
+          <button id="btnOvPol" class="secondary">落子倾向</button>
+          <button id="btnOvOwn" class="secondary">己方占有</button>
+        </div>
+        <p id="reviewHint" class="hint"></p>
+      </div>
+      <div id="status"><span class="strong">状态：</span>请先设置并开始对局</div>
+    </div>
+    <div id="boardWrap">
+      <canvas id="board" width="800" height="800"></canvas>
+      <div id="cubicCoordBar">
+        <label>x <input id="cubicX" type="number" min="0" step="1"></label>
+        <label>y <input id="cubicY" type="number" min="0" step="1"></label>
+        <label>z <input id="cubicZ" type="number" min="0" step="1"></label>
+      </div>
+    </div>
+  </div>
+
+  <div id="setupOverlay">
+    <div id="setupPanel">
+      <div class="setupHead">
+        <h1>对局设置</h1>
+        <button id="btnCloseSetup" class="secondary">收起 ✕</button>
+      </div>
+
+      <div class="setupRow">
+        <div><label for="rulesSel">规则</label>
+          <select id="rulesSel">
+            <option value="go">图围棋</option>
+            <option value="gomoku">五子棋</option>
+            <option value="antigomoku">反五子棋</option>
+          </select>
+        </div>
+        <div><label for="graphSel">棋盘（图）</label><select id="graphSel"></select></div>
+      </div>
+      <div class="setupRow">
+        <div id="winLenBox" hidden>
+          <label for="winLen">连珠 k</label>
+          <input id="winLen" type="number" min="3" max="8" value="5">
+        </div>
+        <div id="numPlayersBox">
+          <label for="numPlayers">人数</label>
+          <select id="numPlayers"><option>2</option><option>3</option><option>4</option></select>
+        </div>
+      </div>
+
+      <div id="playerGrid"></div>
+
+      <button id="btnStart">开始对局</button>
+      <p id="hintGo" class="hint">每位选手可设「真人」或「模型」。checkpoint 须与本局人数一致才可挂载。
+        若仓库有 elo.json，下拉里会显示 Elo（仅展示，不参与训练筛选）。
+        模型席位跑恰好 sim 次 MCTS（根 Dirichlet 与训练相同；每次搜索按网络分派顶点重编号——GNN/MLP/1DCNN 随机重编号、2DCNN 走棋盘对称；走子仍取访问最多的一手）。无匹配权重时只能随机，sim 禁用。
+        贴目为该选手「从分中减」的数值，末位固定 0。规则贴目是先手 7.5（只扣先手）。</p>
+      <p id="hintGomoku" class="hint" hidden>两人、无虚手、无贴目。连珠长度 k 只用于规则判胜，不写进图的边。
+        只列出矩形网格（G19 / G7 / G9 / G15 / G7d / G9d 等）。checkpoint 须为 2P。</p>
+      <p id="hintAntiGomoku" class="hint" hidden>规则与五子棋相同，但谁先连 k 子谁输。满盘无连珠仍为和棋。
+        棋盘列表与五子棋相同。checkpoint 须为 2P。</p>
+    </div>
+  </div>
+
+<script>
+"use strict";
+// ============================ global state ============================
+let G = null;        // graph {key,label,n,grid,vertices,edges,layout,coords3d}
+let S = null;        // game state (players[] per seat)
+let replayMode = false;   // history browse; no new moves
+let layout = null;   // layout coords
+let replayPtr = 0;   // replay cursor
+let autoTimer = null;
+let autoRunning = false;
+let overlayMode = "off";         // off | policy | own (replay, AI moves)
+let pan = {x: 0, y: 0};          // wrap-lattice pan (graphs 3 / 5.5)
+let rotYaw = 0, rotPitch = 0;    // Robinson / cubic rotation
+let cubicFocus = null;           // graph 6: three planes through this vertex
+let dragging = false, dragStart = null, didDrag = false;
+const canvas = document.getElementById("board");
+const ctx = canvas.getContext("2d");
+const BLACK = 1, WHITE = 2;
+
+const $ = id => document.getElementById(id);
+
+let repoModels = [];  // [{name, bytes, kind}] from GET /api/models
+let loadedModels = {};  // { "0": {name, kind}, ... }
+let GRAPH_LIST = [];
+const GOMOKU_KEY_ALIAS = {"0": "G19", "0.5": "G7", "2": "G61"};
+const GOMOKU_BOARD_ORDER = ["0.5", "G7d", "G9", "G9d", "G15", "0", "2", "1", "3"];
+
+function setupIsKInRow() {
+  const r = $("rulesSel").value;
+  return r === "gomoku" || r === "antigomoku";
+}
+
+function liveIsKInRow() {
+  const r = liveRules();
+  return r === "gomoku" || r === "antigomoku";
+}
+
+function liveRules() {
+  const overlay = $("setupOverlay");
+  const overlayOpen = overlay && !overlay.classList.contains("hidden");
+  if (overlayOpen) return $("rulesSel").value || "go";
+  return (S && S.rules) || $("rulesSel").value || "go";
+}
+
+function fillGraphSel() {
+  const gomoku = setupIsKInRow();
+  const prev = $("graphSel").value;
+  const sel = $("graphSel");
+  sel.disabled = false;
+  sel.innerHTML = "";
+  const byKey = Object.fromEntries(GRAPH_LIST.map(g => [g.key, g]));
+  const items = gomoku
+    ? GOMOKU_BOARD_ORDER.map(k => byKey[k]).filter(Boolean)
+    : GRAPH_LIST.filter(g => !String(g.key).startsWith("G"));
+  for (const g of items) {
+    const opt = document.createElement("option");
+    opt.value = g.key;
+    const shown = gomoku && GOMOKU_KEY_ALIAS[g.key] ? GOMOKU_KEY_ALIAS[g.key] : g.key;
+    opt.textContent = `${shown} · ${g.label} (${g.n})`;
+    sel.appendChild(opt);
+  }
+  const keys = [...sel.options].filter(o => !o.disabled).map(o => o.value);
+  if (keys.includes(prev)) sel.value = prev;
+  else if (gomoku && keys.includes("0.5")) sel.value = "0.5";
+  else if (keys.length) sel.value = keys[0];
+}
+
+function syncRulesUi() {
+  const gomoku = setupIsKInRow();
+  $("winLenBox").hidden = !gomoku;
+  $("numPlayersBox").hidden = gomoku;
+  $("hintGo").hidden = gomoku;
+  $("hintGomoku").hidden = $("rulesSel").value !== "gomoku";
+  $("hintAntiGomoku").hidden = $("rulesSel").value !== "antigomoku";
+  if (gomoku) {
+    $("numPlayers").value = "2";
+    $("numPlayers").disabled = true;
+  } else {
+    $("numPlayers").disabled = false;
+  }
+  fillGraphSel();
+  renderPlayerRows();
+  applyTheme();
+}
+
+// ============================ HTTP ============================
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.error || r.status); }
+  return r.json();
+}
+const get = p => api(p);
+const post = (p, body) => api(p, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})});
+
+// ============================ graph load ============================
+async function loadGraphs() {
+  GRAPH_LIST = await get("/api/graphs");
+  fillGraphSel();
+  try { repoModels = await get("/api/models"); }
+  catch (e) { repoModels = []; }
+  try { loadedModels = await get("/api/loaded"); }
+  catch (e) { loadedModels = {}; }
+}
+
+async function loadGraph(key) {
+  G = await get("/api/graph?key=" + encodeURIComponent(key));
+  layout = null;
+  pan = {x: 0, y: 0};
+  rotYaw = 0; rotPitch = 0;
+  cubicFocus = null;
+  if (G.layout) { layoutGrid(); } else { layoutForce(); }
+}
+
+// ============================ layout ============================
+function swapXY(x, y, rotate) {
+  return rotate ? {x: y, y: x} : {x, y};
+}
+
+function layoutRotate(defaultOn) {
+  const r = G.layout && G.layout.rotate;
+  if (r === undefined || r === null) return !!defaultOn;
+  return !!r;
+}
+
+function layoutScale() {
+  const s = G.layout && Number(G.layout.scale);
+  if (s > 0) return s;
+  if (G.key === "0.5" || G.key === "7") return 2;
+  if (G.key === "1" || G.key === "4" || G.key === "4.5" || G.key === "5" || G.key === "5.5") return 1.25;
+  return 1;
+}
+
+function layoutGrid() {
+  const {type, m, n} = G.layout;
+  if (type === "torus") {
+    const cell = Math.max(20, Math.min(37, Math.floor(720 / Math.max(m, n))));
+    canvas.width = 820; canvas.height = 820;
+    const winX = (canvas.width - (n - 1) * cell) / 2;
+    const winY = (canvas.height - (m - 1) * cell) / 2;
+    layout = {type, m, n, cell, winX, winY};
+  } else if (type === "triangular" || type === "tri_torus") {
+    const rotate = layoutRotate(true);
+    const scale = layoutScale();
+    const sx = (m + n - 2) / 2;
+    const sy = (m + n - 2) * Math.sqrt(3) / 2;
+    const cell = Math.max(1, Math.round(Math.max(10, Math.floor(760 / Math.max(sx, sy))) * scale));
+    const wrapPad = type === "tri_torus";
+    let extraX = wrapPad ? 2 * cell : 0;
+    let extraY = wrapPad ? 2 * cell * Math.sqrt(3) : 0;
+    let innerW = sx * cell, innerH = sy * cell;
+    if (rotate) {
+      [innerW, innerH] = [innerH, innerW];
+      [extraX, extraY] = [extraY, extraX];
+    }
+    canvas.width = Math.round(innerW + extraX) + 60;
+    canvas.height = Math.round(innerH + extraY) + 60;
+    layout = {type, m, n, cell, cx: canvas.width / 2, cy: canvas.height / 2, rotate};
+    if (type === "triangular") {
+      const pos = [];
+      for (let i = 0; i < m; i++) {
+        for (let j = 0; j < n; j++) pos[i * n + j] = triLatticeXY(i, j, false);
+      }
+      layout.pos = pos;
+    }
+  } else if (type === "snake") {
+    const rotate = layoutRotate(true);
+    const scale = layoutScale();
+    const rows = 5, cols = 4;
+    const dispM = rotate ? cols : rows;
+    const dispN = rotate ? rows : cols;
+    const cell0 = Math.max(36, Math.min(72, Math.floor(760 / Math.max(dispM, dispN))));
+    const cellWood = Math.max(1, Math.round(cell0 * scale));
+    const cell = Math.max(1, Math.round(cellWood * 0.8));
+    canvas.width = (dispN - 1) * cellWood + 40;
+    canvas.height = (dispM - 1) * cellWood + 40;
+    const offX = (canvas.width - ((dispN - 1) * cell + 40)) / 2;
+    const offY = (canvas.height - ((dispM - 1) * cell + 40)) / 2;
+    const xy = (c, r) => {
+      const p = swapXY(20 + c * cell, 20 + r * cell, rotate);
+      return {x: p.x + offX, y: p.y + offY};
+    };
+    const pos = new Array(G.n);
+    let idx = 0;
+    for (let r = 0; r < rows; r++) {
+      if (r === 2) {
+        pos[idx++] = xy(0, r);
+        pos[idx++] = xy(1.5, r);
+        pos[idx++] = xy(3, r);
+      } else if (r % 2 === 0) {
+        for (let c = 0; c < cols; c++) pos[idx++] = xy(c, r);
+      } else {
+        for (let c = cols - 1; c >= 0; c--) pos[idx++] = xy(c, r);
+      }
+    }
+    layout = {type, pos, m, n, cell, rotate};
+  } else if (type === "cubic") {
+    const n = G.layout.n || 19;
+    canvas.width = 820; canvas.height = 820;
+    layout = {type, n};
+    rotYaw = 0.72;
+    rotPitch = 0.48;
+    recomputeCubic();
+  } else if (type === "robinson") {
+    const scale = layoutScale();
+    canvas.width = Math.round(820 * scale);
+    canvas.height = Math.round(460 * scale);
+    const stoneR = 5 * scale;
+    const nodeR = 0;
+    layout = {type, coords3d: G.coords3d, stoneR, nodeR};
+    recomputeRobinson();
+  } else {
+    const rotate = layoutRotate(false);
+    const scale = layoutScale();
+    const dispM = rotate ? n : m;
+    const dispN = rotate ? m : n;
+    const cell = Math.max(1, Math.round(
+      Math.max(18, Math.min(46, Math.floor(760 / Math.max(dispM, dispN)))) * scale));
+    canvas.width = (dispN - 1) * cell + 40; canvas.height = (dispM - 1) * cell + 40;
+    const pos = [];
+    for (let i = 0; i < G.n; i++) {
+      const r = Math.floor(i / n), c = i % n;
+      pos.push(swapXY(20 + c * cell, 20 + r * cell, rotate));
+    }
+    layout = {type, pos, m: dispM, n: dispN, cell, pad: 20, topPad: 20};
+  }
+}
+
+function layoutForce() {
+  const n = G.n;
+  const wrap = document.getElementById("boardWrap");
+  const W = Math.max(420, Math.floor(wrap && wrap.clientWidth ? wrap.clientWidth : 820));
+  const H = Math.max(420, Math.floor(wrap && wrap.clientHeight ? wrap.clientHeight : 820));
+  canvas.width = W; canvas.height = H;
+  const pos = [];
+  for (let i = 0; i < n; i++) {
+    pos.push({x: W/2 + (Math.random()-0.5)*W*0.7, y: H/2 + (Math.random()-0.5)*H*0.7});
+  }
+  const k = Math.sqrt(W * H / n);
+  const iters = n > 300 ? 120 : 220;
+  for (let it = 0; it < iters; it++) {
+    const t = 0.9 * (1 - it/iters);
+    const disp = pos.map(()=>({x:0,y:0}));
+    for (let i = 0; i < n; i++) {
+      for (let j = i+1; j < n; j++) {
+        let dx = pos[i].x - pos[j].x, dy = pos[i].y - pos[j].y;
+        let d2 = dx*dx + dy*dy; if (d2 < 1) d2 = 1;
+        let d = Math.sqrt(d2), f = k*k/d;
+        disp[i].x += dx/d*f; disp[i].y += dy/d*f;
+        disp[j].x -= dx/d*f; disp[j].y -= dy/d*f;
+      }
+    }
+    for (const [u,v] of G.edges) {
+      let dx = pos[u].x - pos[v].x, dy = pos[u].y - pos[v].y;
+      let d = Math.sqrt(dx*dx+dy*dy); if (d < 1) d = 1;
+      let f = d*d/k;
+      disp[u].x -= dx/d*f; disp[u].y -= dy/d*f;
+      disp[v].x += dx/d*f; disp[v].y += dy/d*f;
+    }
+    for (let i = 0; i < n; i++) {
+      let d = Math.sqrt(disp[i].x*disp[i].x + disp[i].y*disp[i].y); if (d < 1) d = 1;
+      pos[i].x += disp[i].x/d * Math.min(d, t) * 0.1;
+      pos[i].y += disp[i].y/d * Math.min(d, t) * 0.1;
+      pos[i].x = Math.max(24, Math.min(W-24, pos[i].x));
+      pos[i].y = Math.max(24, Math.min(H-24, pos[i].y));
+    }
+  }
+  fitPosToCanvas(pos, W, H, 36);
+  layout = {type: "force", pos};
+}
+
+function fitPosToCanvas(pos, W, H, margin) {
+  let minx = Infinity, maxx = -Infinity, miny = Infinity, maxy = -Infinity;
+  for (const p of pos) {
+    if (p.x < minx) minx = p.x; if (p.x > maxx) maxx = p.x;
+    if (p.y < miny) miny = p.y; if (p.y > maxy) maxy = p.y;
+  }
+  const bw = Math.max(1e-3, maxx - minx), bh = Math.max(1e-3, maxy - miny);
+  const scale = Math.min((W - 2 * margin) / bw, (H - 2 * margin) / bh);
+  const cx = (minx + maxx) / 2, cy = (miny + maxy) / 2;
+  for (const p of pos) {
+    p.x = W / 2 + (p.x - cx) * scale;
+    p.y = H / 2 + (p.y - cy) * scale;
+  }
+}
+
+const ROB_LAT = [0,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90];
+const ROB_X = [1.0000,0.9986,0.9954,0.9900,0.9822,0.9730,0.9600,0.9427,0.9216,0.8962,0.8679,0.8350,0.7986,0.7597,0.7186,0.6732,0.6213,0.5722,0.5322];
+const ROB_Y = [0.0000,0.0620,0.1240,0.1860,0.2480,0.3100,0.3720,0.4340,0.4958,0.5571,0.6176,0.6769,0.7346,0.7903,0.8435,0.8936,0.9394,0.9761,1.0000];
+
+function robinsonInterp(table, latDeg) {
+  const a = Math.min(Math.max(Math.abs(latDeg), 0), 90);
+  const t = a / 5;
+  const i = Math.floor(t);
+  if (i >= 18) return table[18];
+  const f = t - i;
+  return table[i] + f * (table[i + 1] - table[i]);
+}
+
+function robinsonProject(lat, lon) {
+  const latDeg = lat * 180 / Math.PI;
+  const X = robinsonInterp(ROB_X, latDeg);
+  const Y = robinsonInterp(ROB_Y, latDeg);
+  return {x: 0.8487 * X * lon, y: 1.3523 * Y * (lat >= 0 ? 1 : -1)};
+}
+
+function recomputeRobinson() {
+  if (!layout || layout.type !== "robinson") return;
+  const coords = layout.coords3d;
+  const cy = Math.cos(rotYaw), sy = Math.sin(rotYaw);
+  const cp = Math.cos(rotPitch), sp = Math.sin(rotPitch);
+  const projW = 2 * 0.8487 * Math.PI, projH = 2 * 1.3523;
+  const scale = Math.min(canvas.width * 0.95 / projW, canvas.height * 0.95 / projH);
+  const cx = canvas.width / 2, cyc = canvas.height / 2;
+  const pos = [], lons = [];
+  for (const [x, y, z] of coords) {
+    const x1 = x * cy + z * sy;
+    const z1 = -x * sy + z * cy;
+    const y1 = y;
+    const y2 = y1 * cp - z1 * sp;
+    const z2 = y1 * sp + z1 * cp;
+    const lat = Math.asin(Math.max(-1, Math.min(1, z2)));
+    const lon = Math.atan2(y2, x1);
+    const p = robinsonProject(lat, lon);
+    lons.push(lon);
+    pos.push({x: cx + p.x * scale, y: cyc - p.y * scale});
+  }
+  layout.pos = pos;
+  layout.lons = lons;
+}
+
+function occupancyAt(ptr) {
+  const occ = new Array(G.n).fill(0);
+  const hist = S ? S.history : [];
+  for (let i = 0; i < Math.min(ptr, hist.length); i++) {
+    const mv = hist[i];
+    if (mv.vertex == null) continue;
+    occ[mv.vertex] = mv.player;
+    for (const c of mv.captured) occ[c] = 0;
+  }
+  return occ;
+}
+
+function render() {
+  applyTheme();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!G || !layout) return;
+  const occ = replayMode ? occupancyAt(replayPtr) : (S ? S.occupancy : new Array(G.n).fill(0));
+  const lastMove = replayMode ? (replayPtr > 0 ? S.history[replayPtr-1].vertex : null) : (S ? S.last_move : null);
+  const lastCaptured = replayMode ? (replayPtr > 0 ? S.history[replayPtr-1].captured : []) : (S ? S.last_captured : []);
+  const type = layout.type;
+  if (type === "force") renderForce(occ, lastMove, lastCaptured);
+  else if (type === "grid") renderGrid(occ, lastMove, lastCaptured);
+  else if (type === "torus") renderGridTorus(occ, lastMove, lastCaptured);
+  else if (type === "tri_torus") renderTriTorus(occ, lastMove, lastCaptured);
+  else if (type === "robinson") renderRobinson(occ, lastMove, lastCaptured);
+  else if (type === "cubic") renderCubic(occ, lastMove, lastCaptured);
+  else renderNodes(occ, lastMove, lastCaptured);
+  updateStatus(occ);
+  syncReviewBar();
+  if (replayMode || liveIsKInRow()) $("passBar").style.display = "none";
+  else $("passBar").style.display = "flex";
+  syncCubicConfirm();
+}
+
+const PLAYER_COLORS = {1: "#1c1c1c", 2: "#f7f7f5", 3: "#c0392b", 4: "#2e6d9f"};
+const PLAYER_NAMES = {1: "● 黑", 2: "○ 白", 3: "● 红", 4: "● 蓝"};
+let pal = {edge: "#9a5a44", line: "#5c3228", star: "#7a4030", mark: "#c0392b"};
+
+function applyTheme() {
+  const rules = liveRules();
+  let theme = "go";
+  if (rules === "gomoku") theme = "gomoku";
+  else if (rules === "antigomoku") theme = "antigomoku";
+  document.documentElement.dataset.theme = theme;
+  if (rules === "antigomoku") $("brand").textContent = "GKT · 反五子棋";
+  else if (rules === "gomoku") $("brand").textContent = "GKT · 五子棋";
+  else $("brand").textContent = "GKT · 图围棋";
+  const cs = getComputedStyle(document.documentElement);
+  pal.edge = cs.getPropertyValue("--edge").trim() || pal.edge;
+  pal.line = cs.getPropertyValue("--line").trim() || pal.line;
+  pal.star = cs.getPropertyValue("--star").trim() || pal.star;
+  pal.mark = cs.getPropertyValue("--mark").trim() || pal.mark;
+}
+
+function drawStone(x, y, v, radius) {
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI*2);
+  ctx.fillStyle = PLAYER_COLORS[v] || "#1c1c1c";
+  ctx.fill();
+  ctx.strokeStyle = v === 2 ? "#888" : "#000";
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+}
+
+function reviewMove() {
+  if (!replayMode || !S || replayPtr <= 0) return null;
+  return S.history[replayPtr - 1] || null;
+}
+
+function overlayValue(idx) {
+  const mv = reviewMove();
+  if (!mv || overlayMode === "off") return null;
+  if (overlayMode === "policy" && mv.policy) return mv.policy[idx];
+  if (overlayMode === "own" && mv.own) return mv.own[idx];
+  return null;
+}
+
+function overlayFontPx() {
+  const cell = (layout && layout.cell) || (layout && layout.stoneR ? layout.stoneR * 4 : 22);
+  return Math.max(8, Math.min(13, Math.round(cell * 0.32)));
+}
+
+function formatOverlayPct(n) {
+  if (!Number.isFinite(n) || n <= 0) return null;
+  let txt = (n * 100).toFixed(1);
+  if (txt === "0.0" || txt === "-0.0") return null;
+  if (txt.charAt(0) === "0") txt = txt.slice(1);
+  return txt;
+}
+
+function drawOverlayNum(x, y, idx, occ) {
+  const v = overlayValue(idx);
+  if (v == null || v === "") return;
+  const txt = formatOverlayPct(Number(v));
+  if (txt == null) return;
+  const stone = occ[idx];
+  ctx.save();
+  ctx.font = `bold ${overlayFontPx()}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = stone === 1 ? "rgba(0,0,0,0.55)" : "rgba(255,255,255,0.7)";
+  ctx.strokeText(txt, x, y);
+  ctx.fillStyle = stone === 1 ? "#fff" : (stone === 2 ? "#111" : "#1a120e");
+  ctx.fillText(txt, x, y);
+  ctx.restore();
+}
+
+function overlayOnPos(pos, occ) {
+  if (overlayMode === "off") return;
+  for (let i = 0; i < G.n; i++) drawOverlayNum(pos[i].x, pos[i].y, i, occ);
+}
+
+function syncReviewBar() {
+  const bar = $("reviewBar");
+  if (!replayMode) {
+    bar.style.display = "none";
+    return;
+  }
+  bar.style.display = "flex";
+  const mv = reviewMove();
+  const hasPol = !!(mv && ((Array.isArray(mv.policy) && mv.policy.some(x => Number(x) > 0)) || Number(mv.pass_p) > 0));
+  const hasOwn = !!(mv && mv.own);
+  $("btnOvPol").disabled = !hasPol;
+  $("btnOvOwn").disabled = !hasOwn;
+  $("btnOvOff").classList.toggle("ovOn", overlayMode === "off");
+  $("btnOvPol").classList.toggle("ovOn", overlayMode === "policy");
+  $("btnOvOwn").classList.toggle("ovOn", overlayMode === "own");
+  const hint = $("reviewHint");
+  if (!mv) {
+    hint.textContent = "开局：尚无着法。";
+  } else if (!hasPol) {
+    hint.textContent = "此手为人落子，无网络分析。";
+  } else if (overlayMode === "policy") {
+    const pp = formatOverlayPct(Number(mv.pass_p)) || "0.0";
+    hint.textContent = "各点为访问百分比（一位小数，不写 %）；虚手 " + pp + "。";
+  } else if (overlayMode === "own") {
+    hint.textContent = "各点为落子前己方占有百分比（一位小数，不写 %）。来自网络归属头，不是规则计分。";
+  } else if (!hasOwn) {
+    hint.textContent = "可查看落子倾向（此模型无占有头）。";
+  } else {
+    hint.textContent = "选择「落子倾向」或「己方占有」。";
+  }
+}
+
+function setOverlay(mode) {
+  overlayMode = mode;
+  render();
+}
+
+function markLast(pos, lastMove, lastCaptured, markR, stoneR) {
+  if (lastMove != null) {
+    const p = pos[lastMove];
+    ctx.fillStyle = pal.mark;
+    ctx.beginPath(); ctx.arc(p.x, p.y, markR, 0, Math.PI*2); ctx.fill();
+  }
+  for (const c of lastCaptured) {
+    const p = pos[c];
+    ctx.strokeStyle = pal.mark; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p.x, p.y, stoneR+2, 0, Math.PI*2); ctx.stroke();
+  }
+}
+
+function renderForce(occ, lastMove, lastCaptured) {
+  ctx.strokeStyle = pal.edge; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const [u,v] of G.edges) {
+    ctx.moveTo(layout.pos[u].x, layout.pos[u].y);
+    ctx.lineTo(layout.pos[v].x, layout.pos[v].y);
+  }
+  ctx.stroke();
+  for (let i = 0; i < G.n; i++) {
+    const p = layout.pos[i], v = occ[i];
+    if (v === 0) {
+      ctx.fillStyle = pal.star;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI*2); ctx.fill();
+    } else {
+      drawStone(p.x, p.y, v, 11);
+    }
+  }
+  markLast(layout.pos, lastMove, lastCaptured, 5, 11);
+  overlayOnPos(layout.pos, occ);
+}
+
+function renderGrid(occ, lastMove, lastCaptured) {
+  const {m, n, cell, pad, topPad} = layout;
+  ctx.strokeStyle = pal.edge; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < m; i++) {
+    ctx.moveTo(pad, topPad + i*cell); ctx.lineTo(pad + (n-1)*cell, topPad + i*cell);
+  }
+  for (let j = 0; j < n; j++) {
+    ctx.moveTo(pad + j*cell, topPad); ctx.lineTo(pad + j*cell, topPad + (m-1)*cell);
+  }
+  ctx.stroke();
+  const stars = (m === 19 && n === 19) ? [[3,3],[3,9],[3,15],[9,3],[9,9],[9,15],[15,3],[15,9],[15,15]]
+              : (m === 7 && n === 7) ? [[3,3]] : [];
+  ctx.fillStyle = pal.line;
+  for (const [r,c] of stars) {
+    ctx.beginPath(); ctx.arc(pad + c*cell, topPad + r*cell, cell*0.08, 0, Math.PI*2); ctx.fill();
+  }
+  const stoneR = cell * (G.key === "0.5" ? 0.225 : 0.45);
+  for (let i = 0; i < G.n; i++) {
+    const v = occ[i];
+    if (v === 0) continue;
+    const p = layout.pos[i];
+    drawStone(p.x, p.y, v, stoneR);
+  }
+  markLast(layout.pos, lastMove, lastCaptured, stoneR * 0.36, stoneR);
+  overlayOnPos(layout.pos, occ);
+}
+
+function renderNodes(occ, lastMove, lastCaptured) {
+  const cell = layout.cell || 40;
+  const hidePts = layout.type === "triangular";
+  const nodeR = hidePts ? 0 : (layout.type === "snake" ? cell * 0.16 : Math.max(cell * 0.13, 3));
+  const stoneR = layout.type === "snake" ? cell * 0.42 : cell * 0.38;
+  ctx.strokeStyle = pal.edge; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const [u,v] of G.edges) {
+    ctx.moveTo(layout.pos[u].x, layout.pos[u].y);
+    ctx.lineTo(layout.pos[v].x, layout.pos[v].y);
+  }
+  ctx.stroke();
+  for (let i = 0; i < G.n; i++) {
+    const p = layout.pos[i], v = occ[i];
+    if (v === 0) {
+      if (nodeR > 0) {
+        ctx.fillStyle = pal.star;
+        ctx.beginPath(); ctx.arc(p.x, p.y, nodeR, 0, Math.PI*2); ctx.fill();
+      }
+    } else {
+      drawStone(p.x, p.y, v, stoneR);
+    }
+  }
+  markLast(layout.pos, lastMove, lastCaptured, stoneR * 0.4, stoneR);
+  overlayOnPos(layout.pos, occ);
+}
+
+function renderRobinson(occ, lastMove, lastCaptured) {
+  const stoneR = layout.stoneR || 10;
+  const nodeR = layout.nodeR == null ? 3 : layout.nodeR;
+  ctx.strokeStyle = pal.edge; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const [u, v] of G.edges) {
+    if (Math.abs(layout.lons[u] - layout.lons[v]) > Math.PI) continue;
+    ctx.moveTo(layout.pos[u].x, layout.pos[u].y);
+    ctx.lineTo(layout.pos[v].x, layout.pos[v].y);
+  }
+  ctx.stroke();
+  for (let i = 0; i < G.n; i++) {
+    const p = layout.pos[i], v = occ[i];
+    if (v === 0) {
+      if (nodeR > 0) {
+        ctx.fillStyle = pal.star;
+        ctx.beginPath(); ctx.arc(p.x, p.y, nodeR, 0, Math.PI * 2); ctx.fill();
+      }
+    } else {
+      drawStone(p.x, p.y, v, stoneR);
+    }
+  }
+  markLast(layout.pos, lastMove, lastCaptured, Math.max(stoneR * 0.5, 3), stoneR);
+  overlayOnPos(layout.pos, occ);
+}
+
+function cubicXYZ(idx) {
+  const n = layout.n;
+  return {x: idx % n, y: Math.floor(idx / n) % n, z: Math.floor(idx / (n * n))};
+}
+
+function cubicIdx(x, y, z) {
+  const n = layout.n;
+  return z * n * n + y * n + x;
+}
+
+function cubicIsOuter(p) {
+  const n = layout.n, last = n - 1;
+  return p.x === 0 || p.x === last || p.y === 0 || p.y === last || p.z === 0 || p.z === last;
+}
+
+function cubicOnPlanes(p) {
+  if (cubicFocus == null) return cubicIsOuter(p);
+  const f = cubicXYZ(cubicFocus);
+  return p.x === f.x || p.y === f.y || p.z === f.z;
+}
+
+function recomputeCubic() {
+  if (!layout || layout.type !== "cubic") return;
+  const n = layout.n, h = (n - 1) / 2;
+  const cy = Math.cos(rotYaw), sy = Math.sin(rotYaw);
+  const cp = Math.cos(rotPitch), sp = Math.sin(rotPitch);
+  const scale = Math.min(canvas.width, canvas.height) * 0.48 / (h * Math.sqrt(3));
+  const cx = canvas.width / 2, cyc = canvas.height / 2;
+  const pos = new Array(n * n * n), depth = new Array(n * n * n);
+  for (let z = 0; z < n; z++) {
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const X = x - h, Y = y - h, Z = z - h;
+        const x1 = X * cy + Z * sy;
+        const z1 = -X * sy + Z * cy;
+        const y2 = Y * cp - z1 * sp;
+        const z2 = Y * sp + z1 * cp;
+        const idx = cubicIdx(x, y, z);
+        pos[idx] = {x: cx + x1 * scale, y: cyc - y2 * scale};
+        depth[idx] = z2;
+      }
+    }
+  }
+  layout.pos = pos;
+  layout.depth = depth;
+  layout.scale3 = scale;
+}
+
+function cubicLine(a, b) {
+  ctx.moveTo(layout.pos[a].x, layout.pos[a].y);
+  ctx.lineTo(layout.pos[b].x, layout.pos[b].y);
+}
+
+function cubicStrokePlanes(xs, ys, zs) {
+  const n = layout.n, last = n - 1;
+  ctx.beginPath();
+  for (const x of xs) {
+    for (let a = 0; a < n; a++) {
+      cubicLine(cubicIdx(x, a, 0), cubicIdx(x, a, last));
+      cubicLine(cubicIdx(x, 0, a), cubicIdx(x, last, a));
+    }
+  }
+  for (const y of ys) {
+    for (let a = 0; a < n; a++) {
+      cubicLine(cubicIdx(a, y, 0), cubicIdx(a, y, last));
+      cubicLine(cubicIdx(0, y, a), cubicIdx(last, y, a));
+    }
+  }
+  for (const z of zs) {
+    for (let a = 0; a < n; a++) {
+      cubicLine(cubicIdx(a, 0, z), cubicIdx(a, last, z));
+      cubicLine(cubicIdx(0, a, z), cubicIdx(last, a, z));
+    }
+  }
+  ctx.stroke();
+}
+
+function renderCubic(occ, lastMove, lastCaptured) {
+  recomputeCubic();
+  const n = layout.n, last = n - 1, scale = layout.scale3;
+  const stoneR = Math.max(2.4, scale * 0.28);
+  const sliced = cubicFocus != null;
+  ctx.strokeStyle = pal.edge;
+  ctx.save();
+  ctx.globalAlpha = sliced ? 0.12 : 0.55;
+  ctx.lineWidth = 1;
+  cubicStrokePlanes([0, last], [0, last], [0, last]);
+  ctx.restore();
+  if (sliced) {
+    const f = cubicXYZ(cubicFocus);
+    ctx.lineWidth = 1.15;
+    cubicStrokePlanes([f.x], [f.y], [f.z]);
+  }
+  const order = [];
+  for (let i = 0; i < n * n * n; i++) {
+    if (occ[i] !== 0) order.push(i);
+  }
+  order.sort((a, b) => layout.depth[a] - layout.depth[b]);
+  for (const i of order) {
+    const on = cubicOnPlanes(cubicXYZ(i));
+    const sp = layout.pos[i];
+    if (!on) {
+      ctx.save();
+      ctx.globalAlpha = 0.18;
+      drawStone(sp.x, sp.y, occ[i], stoneR * 0.7);
+      ctx.restore();
+    } else {
+      drawStone(sp.x, sp.y, occ[i], stoneR);
+    }
+  }
+  if (cubicFocus != null) {
+    const sp = layout.pos[cubicFocus];
+    ctx.strokeStyle = "#2e6d9f"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sp.x, sp.y, stoneR + 3, 0, Math.PI * 2); ctx.stroke();
+  }
+  if (lastMove != null && cubicOnPlanes(cubicXYZ(lastMove))) {
+    const sp = layout.pos[lastMove];
+    ctx.fillStyle = pal.mark;
+    ctx.beginPath(); ctx.arc(sp.x, sp.y, stoneR * 0.36, 0, Math.PI * 2); ctx.fill();
+  }
+  for (const c of lastCaptured) {
+    if (!cubicOnPlanes(cubicXYZ(c))) continue;
+    const sp = layout.pos[c];
+    ctx.strokeStyle = pal.mark; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sp.x, sp.y, stoneR + 2, 0, Math.PI * 2); ctx.stroke();
+  }
+  if (overlayMode !== "off") {
+    for (let i = 0; i < n * n * n; i++) {
+      if (!cubicOnPlanes(cubicXYZ(i))) continue;
+      drawOverlayNum(layout.pos[i].x, layout.pos[i].y, i, occ);
+    }
+  }
+}
+
+function wrapIdx(i, j, m, n) {
+  i = ((i % m) + m) % m;
+  j = ((j % n) + n) % n;
+  return i * n + j;
+}
+
+function gridTorusXY(i, j, withPan) {
+  const {cell, winX, winY} = layout;
+  const px = withPan ? pan.x : 0, py = withPan ? pan.y : 0;
+  return {x: winX + px + j * cell, y: winY + py + i * cell};
+}
+
+function screenToGridTorus(x, y, withPan) {
+  const {cell, winX, winY} = layout;
+  const px = withPan ? pan.x : 0, py = withPan ? pan.y : 0;
+  return {i: (y - winY - py) / cell, j: (x - winX - px) / cell};
+}
+
+function latticeVisibleRange(toLattice) {
+  const corners = [[0, 0], [canvas.width, 0], [canvas.width, canvas.height], [0, canvas.height]];
+  let i0 = 1e9, i1 = -1e9, j0 = 1e9, j1 = -1e9;
+  for (const [sx, sy] of corners) {
+    const t = toLattice(sx, sy);
+    i0 = Math.min(i0, t.i); i1 = Math.max(i1, t.i);
+    j0 = Math.min(j0, t.j); j1 = Math.max(j1, t.j);
+  }
+  return {
+    i0: Math.floor(i0) - 1, i1: Math.ceil(i1) + 1,
+    j0: Math.floor(j0) - 1, j1: Math.ceil(j1) + 1,
+  };
+}
+
+function fadeOutsideHome(corners) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, canvas.width, canvas.height);
+  ctx.moveTo(corners[0].x, corners[0].y);
+  for (let k = 1; k < corners.length; k++) ctx.lineTo(corners[k].x, corners[k].y);
+  ctx.closePath();
+  ctx.clip("evenodd");
+  ctx.fillStyle = "rgba(220,179,92,0.55)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.restore();
+}
+
+function renderGridTorus(occ, lastMove, lastCaptured) {
+  const {m, n, cell} = layout;
+  const {i0, i1, j0, j1} = latticeVisibleRange((x, y) => screenToGridTorus(x, y, true));
+  ctx.strokeStyle = pal.edge; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = i0; i <= i1; i++) {
+    for (let j = j0; j <= j1; j++) {
+      const p = gridTorusXY(i, j, true);
+      const pe = gridTorusXY(i, j + 1, true);
+      const ps = gridTorusXY(i + 1, j, true);
+      ctx.moveTo(p.x, p.y); ctx.lineTo(pe.x, pe.y);
+      ctx.moveTo(p.x, p.y); ctx.lineTo(ps.x, ps.y);
+    }
+  }
+  ctx.stroke();
+  const stoneR = cell * 0.45;
+  for (let i = i0; i <= i1; i++) {
+    for (let j = j0; j <= j1; j++) {
+      const v = occ[wrapIdx(i, j, m, n)];
+      if (v === 0) continue;
+      const p = gridTorusXY(i, j, true);
+      drawStone(p.x, p.y, v, stoneR);
+    }
+  }
+  fadeOutsideHome([
+    gridTorusXY(0, 0, false),
+    gridTorusXY(0, n - 1, false),
+    gridTorusXY(m - 1, n - 1, false),
+    gridTorusXY(m - 1, 0, false),
+  ]);
+  function inClear(p) {
+    const t = screenToGridTorus(p.x, p.y, false);
+    return t.i >= -0.45 && t.i <= m - 0.55 && t.j >= -0.45 && t.j <= n - 0.55;
+  }
+  if (lastMove != null) {
+    for (let i = i0; i <= i1; i++) {
+      for (let j = j0; j <= j1; j++) {
+        if (wrapIdx(i, j, m, n) !== lastMove) continue;
+        const p = gridTorusXY(i, j, true);
+        if (!inClear(p)) continue;
+        ctx.fillStyle = pal.mark;
+        ctx.beginPath(); ctx.arc(p.x, p.y, stoneR * 0.36, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+  }
+  for (const cap of lastCaptured) {
+    for (let i = i0; i <= i1; i++) {
+      for (let j = j0; j <= j1; j++) {
+        if (wrapIdx(i, j, m, n) !== cap) continue;
+        const p = gridTorusXY(i, j, true);
+        if (!inClear(p)) continue;
+        ctx.strokeStyle = pal.mark; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(p.x, p.y, stoneR + 2, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+  }
+  if (overlayMode !== "off") {
+    for (let i = i0; i <= i1; i++) {
+      for (let j = j0; j <= j1; j++) {
+        const p = gridTorusXY(i, j, true);
+        if (!inClear(p)) continue;
+        drawOverlayNum(p.x, p.y, wrapIdx(i, j, m, n), occ);
+      }
+    }
+  }
+}
+
+function triLatticeXY(i, j, withPan) {
+  const {m, n, cell, cx, cy, rotate} = layout;
+  const ox = (m + n - 2) / 2;
+  const px = withPan ? pan.x : 0, py = withPan ? pan.y : 0;
+  const p = swapXY((i + j - ox) * cell / 2, (i - j) * cell * Math.sqrt(3) / 2, rotate);
+  return {x: cx + px + p.x, y: cy + py + p.y};
+}
+
+function screenToTriLattice(x, y, withPan) {
+  const {m, n, cell, cx, cy, rotate} = layout;
+  const ox = (m + n - 2) / 2;
+  const px = withPan ? pan.x : 0, py = withPan ? pan.y : 0;
+  const p = swapXY(x - cx - px, y - cy - py, rotate);
+  const xp = 2 * p.x / cell + ox;
+  const yp = 2 * p.y / (cell * Math.sqrt(3));
+  return {i: (xp + yp) / 2, j: (xp - yp) / 2};
+}
+
+function renderTriTorus(occ, lastMove, lastCaptured) {
+  const {m, n, cell} = layout;
+  const {i0, i1, j0, j1} = latticeVisibleRange((x, y) => screenToTriLattice(x, y, true));
+  ctx.strokeStyle = pal.edge; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = i0; i <= i1; i++) {
+    for (let j = j0; j <= j1; j++) {
+      const p = triLatticeXY(i, j, true);
+      const pe = triLatticeXY(i, j + 1, true);
+      const ps = triLatticeXY(i + 1, j, true);
+      const pd = triLatticeXY(i + 1, j + 1, true);
+      ctx.moveTo(p.x, p.y); ctx.lineTo(pe.x, pe.y);
+      ctx.moveTo(p.x, p.y); ctx.lineTo(ps.x, ps.y);
+      ctx.moveTo(p.x, p.y); ctx.lineTo(pd.x, pd.y);
+    }
+  }
+  ctx.stroke();
+  const stoneR = cell * 0.38;
+  for (let i = i0; i <= i1; i++) {
+    for (let j = j0; j <= j1; j++) {
+      const v = occ[wrapIdx(i, j, m, n)];
+      if (v === 0) continue;
+      const p = triLatticeXY(i, j, true);
+      drawStone(p.x, p.y, v, stoneR);
+    }
+  }
+  fadeOutsideHome([
+    triLatticeXY(0, 0, false),
+    triLatticeXY(m - 1, 0, false),
+    triLatticeXY(m - 1, n - 1, false),
+    triLatticeXY(0, n - 1, false),
+  ]);
+  function inClear(p) {
+    const t = screenToTriLattice(p.x, p.y, false);
+    return t.i >= -0.45 && t.i <= m - 0.55 && t.j >= -0.45 && t.j <= n - 0.55;
+  }
+  if (lastMove != null) {
+    for (let i = i0; i <= i1; i++) {
+      for (let j = j0; j <= j1; j++) {
+        if (wrapIdx(i, j, m, n) !== lastMove) continue;
+        const p = triLatticeXY(i, j, true);
+        if (!inClear(p)) continue;
+        ctx.fillStyle = pal.mark;
+        ctx.beginPath(); ctx.arc(p.x, p.y, stoneR * 0.4, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+  }
+  for (const cap of lastCaptured) {
+    for (let i = i0; i <= i1; i++) {
+      for (let j = j0; j <= j1; j++) {
+        if (wrapIdx(i, j, m, n) !== cap) continue;
+        const p = triLatticeXY(i, j, true);
+        if (!inClear(p)) continue;
+        ctx.strokeStyle = pal.mark; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(p.x, p.y, stoneR + 2, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+  }
+  if (overlayMode !== "off") {
+    for (let i = i0; i <= i1; i++) {
+      for (let j = j0; j <= j1; j++) {
+        const p = triLatticeXY(i, j, true);
+        if (!inClear(p)) continue;
+        drawOverlayNum(p.x, p.y, wrapIdx(i, j, m, n), occ);
+      }
+    }
+  }
+}
+
+function cubicStatusHint() {
+  if (!layout || layout.type !== "cubic") return "";
+  const keys = "W/S 调 x，Q/E 调 y，A/D 调 z。";
+  if (cubicFocus == null) {
+    return `<br><span class="hint">图 6：点最外侧交叉点查看三平面；Confirm 落子，Cancel 取消选点。${keys}</span>`;
+  }
+  return `<br><span class="hint">已选定（蓝圈）。点三平面可切换切片；Confirm 落子，Cancel 取消。${keys}</span>`;
+}
+
+function updateStatus(occ) {
+  const st = $("status");
+  if (!S || !S.ready) {
+    st.innerHTML = '<span class="strong">状态：</span>请先设置并开始对局' + cubicStatusHint();
+    return;
+  }
+  const pname = p => PLAYER_NAMES[p] || ("玩家" + p);
+  let html = "";
+  if (replayMode) {
+    html = `<span class="strong">回放</span> 第 ${replayPtr}/${S.history.length} 手`;
+  } else {
+    const cur = S.to_move;
+    const pl = S.players[cur - 1];
+    const isHuman = pl.is_human;
+    let who = "真人";
+    if (!isHuman) {
+      if (!pl.has_model || pl.model_kind === "random" || pl.model_name === "random")
+        who = "随机";
+      else
+        who = (pl.model_name || "模型") + (pl.model_kind ? "（" + pl.model_kind + "）" : "");
+    }
+    html = `<span class="strong">当前方：${pname(cur)}（${who}）</span> · 第 ${S.move_no} 手`;
+    if (S.rules === "gomoku" || S.rules === "antigomoku") html += ` · k=${S.win_length || 5}`;
+    if (S.game_over) {
+      if (S.scores) {
+        const parts = Object.keys(S.scores).map(k => pname(+k) + " " + S.scores[k].toFixed(1)).join(" · ");
+        const winners = Object.keys(S.scores).filter(k => {
+          const v = S.scores[k];
+          return v === Math.max(...Object.values(S.scores));
+        }).map(k => pname(+k));
+        html = `<span class="strong">终局</span> · ${parts} · ${winners.length > 1 ? "平局" : winners[0] + "胜"}`;
+      } else {
+        html = `<span class="strong">终局</span>`;
+      }
+    }
+    if (S.eliminated && S.eliminated.some(Boolean)) {
+      const outs = S.eliminated.map((e, i) => e ? pname(i + 1) : null).filter(Boolean);
+      html += ` · <span style="color:#8a7a5a">出局：${outs.join("、")}</span>`;
+    }
+    if (!S.game_over && isHuman) {
+      html += ' · <span style="color:var(--accent)">轮到你落子</span>';
+    }
+  }
+  st.innerHTML = html + cubicStatusHint();
+}
+
+function netTag(m) {
+  if (!m || m.kind === "random" || m.name === "random") return "";
+  let t = (m.kind || "") + " · " + m.players + "P";
+  if (m.elo != null && m.elo !== "") t += " · " + Math.round(Number(m.elo));
+  return t;
+}
+function modelFitsGame(m, n) {
+  if (!m) return false;
+  if (m.kind === "random" || m.name === "random") return true;
+  return m.players === n;
+}
+
+function renderPlayerRows() {
+  const n = parseInt($("numPlayers").value) || 2;
+  const gomoku = setupIsKInRow();
+  const box = $("playerGrid");
+  box.innerHTML = "";
+  const matching = repoModels.filter(m => m.players === n);
+  const baseKomi = [7.5, 4.5, 2.5];
+  for (let i = 0; i < n; i++) {
+    const isLast = (i === n - 1);
+    const isFirst = (i === 0);
+    const isHuman = isFirst;
+    const komiVal = isLast ? 0 : (baseKomi[i] ?? 0);
+    let pre = loadedModels[String(i)] || loadedModels[i] || loadedModels["0"] || null;
+    if (pre && !modelFitsGame(pre, n)) pre = null;
+    const isRandom = !pre || pre.kind === "random" || pre.name === "random";
+    const selectedName = isRandom ? "__random__" : (pre && pre.name ? pre.name : "");
+    const repoOpts = [
+      `<option value="__random__"${isRandom ? " selected" : ""}>随机策略</option>`,
+      '<option value="">（选择文件）</option>',
+    ].concat(
+      matching.map(m => {
+        const mb = (m.bytes / (1024 * 1024)).toFixed(1);
+        const sel = !isRandom && m.name === selectedName ? " selected" : "";
+        const kindTag = netTag(m) ? " · " + netTag(m) : "";
+        return `<option value="${m.name}"${sel}>${m.name}${kindTag} (${mb} MB)</option>`;
+      })
+    ).join("");
+    const loadedLabel = isRandom
+      ? (matching.length ? "随机策略（均匀合法着" + (gomoku ? "）" : " + 虚手）") : "随机策略（无 " + n + "P 权重）")
+      : ("已加载：" + pre.name + (netTag(pre) ? "（" + netTag(pre) + "）" : ""));
+    const komiBlock = gomoku ? "" : `
+        <div><label>贴目（从分中减）</label><input type="number" class="pKomi" value="${komiVal}" step="0.5" ${isLast ? 'disabled' : ''}></div>`;
+    const row = document.createElement("div");
+    row.className = "playerRow";
+    row.innerHTML = `
+      <div class="playerHead">选手 ${i + 1} · ${PLAYER_NAMES[i + 1]}</div>
+      <div class="row">
+        ${komiBlock}
+        <div><label>属性</label><select class="pType">
+          <option value="human" ${isHuman ? 'selected' : ''}>真人</option>
+          <option value="model" ${isHuman ? '' : 'selected'}>模型</option>
+        </select></div>
+      </div>
+      <div class="modelBox">
+        <div class="row">
+          <div>
+            <label>模型文件</label>
+            <select class="pRepoModel">${repoOpts}</select>
+          </div>
+          <div><label>sim</label><input type="number" class="pSim" value="200" min="1" step="1" ${isHuman || isRandom ? 'disabled' : ''}></div>
+        </div>
+        <span class="modelName">${loadedLabel}</span>
+        <input type="file" class="modelFile" accept=".pt,.pth,.npz" style="display:none">
+      </div>`;
+    box.appendChild(row);
+
+    const typeSel = row.querySelector(".pType");
+    const modelBox = row.querySelector(".modelBox");
+    const simInput = row.querySelector(".pSim");
+    const repoSel = row.querySelector(".pRepoModel");
+    const sync = () => {
+      const isModel = typeSel.value === "model";
+      modelBox.style.display = isModel ? "" : "none";
+      const randomOn = repoSel.value === "__random__";
+      simInput.disabled = !isModel || randomOn;
+      if (!isModel || randomOn) simInput.value = 0;
+    };
+    typeSel.addEventListener("change", sync);
+    sync();
+
+    const mountWarehouse = async (name) => {
+      const nameEl = row.querySelector(".modelName");
+      nameEl.textContent = "加载中…";
+      try {
+        const d = await post("/api/load_model", {player: i, name});
+        loadedModels[String(i)] = {name: d.name || name, kind: d.kind, players: d.players};
+        nameEl.textContent = "已加载：" + (d.name || name) + (netTag(d) ? "（" + netTag(d) + "）" : "");
+      } catch (e) {
+        nameEl.textContent = "加载失败：" + e.message;
+      }
+    };
+
+    row.querySelector(".pRepoModel").addEventListener("change", async () => {
+      const name = row.querySelector(".pRepoModel").value;
+      sync();
+      if (name === "__random__") {
+        const nameEl = row.querySelector(".modelName");
+        nameEl.textContent = "加载中…";
+        try {
+          await post("/api/load_model", {player: i, name: "__random__"});
+          loadedModels[String(i)] = {name: "random", kind: "random", players: 0};
+          nameEl.textContent = "随机策略（均匀合法着 + 虚手）";
+        } catch (e) {
+          nameEl.textContent = "设置失败：" + e.message;
+        }
+        return;
+      }
+      if (!name) {
+        const inp = row.querySelector(".modelFile");
+        inp.value = "";
+        inp.click();
+        return;
+      }
+      await mountWarehouse(name);
+    });
+    row.querySelector(".modelFile").addEventListener("change", async (ev) => {
+      const f = ev.target.files[0];
+      if (!f) return;
+      const nameEl = row.querySelector(".modelName");
+      nameEl.textContent = "加载中…";
+      try {
+        const r = await fetch(`/api/upload_model?player=${i}`,
+          {method: "POST", headers: {
+            "X-Filename": encodeURIComponent(f.name),
+          }, body: f});
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || r.status);
+        loadedModels[String(i)] = {name: d.name || f.name, kind: d.kind, players: d.players};
+        nameEl.textContent = "已加载：" + (d.name || f.name) + (netTag(d) ? "（" + netTag(d) + "）" : "");
+      } catch (e) {
+        nameEl.textContent = "加载失败：" + e.message;
+      }
+    });
+  }
+}
+
+// ============================ game control ============================
+async function newGame() {
+  stopAuto();
+  const key = $("graphSel").value;
+  const rows = [...document.querySelectorAll("#playerGrid .playerRow")];
+  const gomoku = setupIsKInRow();
+  const players = rows.map(row => {
+    const komiEl = row.querySelector(".pKomi");
+    return {
+      komi: gomoku ? 0 : (komiEl ? (parseFloat(komiEl.value) || 0) : 0),
+      is_human: row.querySelector(".pType").value === "human",
+      sim: parseInt(row.querySelector(".pSim").value) || 0,
+    };
+  });
+  try {
+    await loadGraph(key);
+    const r = await post("/api/setup", {
+      key, players,
+      rules: $("rulesSel").value,
+      win_length: parseInt($("winLen").value, 10) || 5,
+    });
+    S = r.state;
+  } catch (e) {
+    alert("无法开始对局：" + e.message);
+    return;
+  }
+  replayMode = false;
+  $("btnReplay").textContent = "回放";
+  $("replayCtl").style.display = "none";
+  replayPtr = S.history.length;
+  hideSetup();
+  updateAutoBtn();
+  render();
+}
+
+function stopAuto() {
+  autoRunning = false;
+  if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+  $("btnAuto").textContent = "自动播放";
+}
+
+function startAuto() {
+  stopAuto();
+  autoRunning = true;
+  $("btnAuto").textContent = "停止";
+  const step = async () => {
+    if (!autoRunning) return;
+    if (replayMode) {
+      if (!S || replayPtr >= S.history.length) { stopAuto(); return; }
+      replayPtr++;
+      render();
+      autoTimer = setTimeout(step, 500);
+      return;
+    }
+    if (!S || S.game_over) { stopAuto(); return; }
+    if (S.players[S.to_move - 1].is_human) { stopAuto(); return; }  // human to-move: stop
+    const r = await post("/api/advance", {});
+    if (!autoRunning) return;
+    S = r.state;
+    render();
+    if (!S.game_over && !S.players[S.to_move - 1].is_human) autoTimer = setTimeout(step, 300);
+    else stopAuto();
+  };
+  autoTimer = setTimeout(step, 0);
+}
+
+function toggleAuto() {
+  if (autoRunning) { stopAuto(); } else { startAuto(); }
+}
+
+function setReplay(on) {
+  replayMode = on;
+  $("btnReplay").textContent = on ? "退出回放" : "回放";
+  $("replayCtl").style.display = on ? "inline-flex" : "none";
+  stopAuto();
+  if (on && S) { replayPtr = 0; }
+  updateAutoBtn();
+  render();
+}
+
+// Auto-play is useful only for (1) all-model spectator games, or (2) replay.
+// Hidden in mixed human/model games (would stop on the first human turn).
+function updateAutoBtn() {
+  const allModels = S && S.ready && S.players.length > 0 && S.players.every(p => !p.is_human);
+  const show = replayMode || allModels;
+  $("btnAuto").style.display = show ? "" : "none";
+  if (!show) stopAuto();
+}
+
+function showSetup() {
+  $("setupOverlay").classList.remove("hidden");
+  applyTheme();
+}
+function hideSetup() {
+  $("setupOverlay").classList.add("hidden");
+  applyTheme();
+  render();
+}
+
+// ============================ input ============================
+function canvasPos(ev) {
+  const rect = canvas.getBoundingClientRect();
+  return {x: (ev.clientX - rect.left) * (canvas.width / rect.width),
+          y: (ev.clientY - rect.top) * (canvas.height / rect.height)};
+}
+
+function hitVertex(x, y) {
+  if (!layout) return -1;
+  const {m, n, cell} = layout;
+  if (layout.type === "cubic") {
+    if (!layout.pos) recomputeCubic();
+    const hitR = Math.max(7, (layout.scale3 || 8) * 0.42);
+    const r2 = hitR * hitR;
+    let best = -1, bd = 1e9, bz = -1e9;
+    for (let i = 0; i < G.n; i++) {
+      if (!cubicOnPlanes(cubicXYZ(i))) continue;
+      const p = layout.pos[i];
+      const dx = x - p.x, dy = y - p.y, d = dx * dx + dy * dy;
+      if (d > r2) continue;
+      const z = layout.depth[i];
+      if (z > bz + 1e-6 || (Math.abs(z - bz) <= 1e-6 && d < bd)) {
+        bz = z; bd = d; best = i;
+      }
+    }
+    return best;
+  }
+  if (layout.type === "grid") {
+    // grid (incl. 90-deg graph 1): nearest vertex hit test
+    let best = -1, bd = 1e9;
+    const hitR = cell * 0.5;
+    for (let i = 0; i < G.n; i++) {
+      const dx = x - layout.pos[i].x, dy = y - layout.pos[i].y;
+      const d = dx*dx + dy*dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return bd < hitR*hitR ? best : -1;
+  }
+  if (layout.type === "force" || layout.type === "triangular" || layout.type === "snake" || layout.type === "robinson") {
+    const hitR = layout.type === "force" ? 14 : (layout.type === "robinson" ? 12 : (layout.cell || 20) * 0.5);
+    let best = -1, bd = 1e9;
+    for (let i = 0; i < G.n; i++) {
+      const dx = x - layout.pos[i].x, dy = y - layout.pos[i].y;
+      const d = dx*dx + dy*dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return bd < hitR*hitR ? best : -1;
+  }
+  if (layout.type === "tri_torus" || layout.type === "torus") {
+    const t = layout.type === "torus" ? screenToGridTorus(x, y, true) : screenToTriLattice(x, y, true);
+    const ii = Math.round(t.i), jj = Math.round(t.j);
+    const p = layout.type === "torus" ? gridTorusXY(ii, jj, true) : triLatticeXY(ii, jj, true);
+    const hitR = cell * 0.5;
+    const dx = x - p.x, dy = y - p.y;
+    if (dx * dx + dy * dy > hitR * hitR) return -1;
+    return wrapIdx(ii, jj, m, n);
+  }
+  return -1;
+}
+
+function currentIsHuman() {
+  return S && S.ready && !S.game_over && S.players[S.to_move - 1].is_human;
+}
+
+function cubicClamp(v) {
+  const n = layout && layout.n ? layout.n : 19;
+  v = parseInt(v, 10);
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(n - 1, v));
+}
+
+function setCubicFocus(idx) {
+  cubicFocus = idx;
+  render();
+}
+
+function cubicNudge(axis, delta) {
+  if (!layout || layout.type !== "cubic") return;
+  const n = layout.n;
+  const p = cubicFocus == null ? {x: 0, y: 0, z: 0} : cubicXYZ(cubicFocus);
+  p[axis] = Math.max(0, Math.min(n - 1, p[axis] + delta));
+  setCubicFocus(cubicIdx(p.x, p.y, p.z));
+}
+
+function applyCubicCoordInputs() {
+  if (!layout || layout.type !== "cubic") return;
+  setCubicFocus(cubicIdx(cubicClamp($("cubicX").value), cubicClamp($("cubicY").value), cubicClamp($("cubicZ").value)));
+}
+
+function syncCubicConfirm() {
+  const cubic = layout && layout.type === "cubic";
+  const showBtns = cubic && $("passBar").style.display !== "none";
+  $("cubicMoveRow").style.display = showBtns ? "flex" : "none";
+  $("cubicCoordBar").style.display = cubic ? "flex" : "none";
+  const occ = S && S.occupancy;
+  $("btnConfirm").disabled = !(showBtns && currentIsHuman() && cubicFocus != null && occ && occ[cubicFocus] === 0);
+  $("btnCancel").disabled = !(showBtns && cubicFocus != null);
+  if (!cubic) return;
+  const last = String(layout.n - 1);
+  for (const id of ["cubicX", "cubicY", "cubicZ"]) $(id).max = last;
+  if (cubicFocus == null) {
+    $("cubicX").value = $("cubicY").value = $("cubicZ").value = "";
+    return;
+  }
+  const p = cubicXYZ(cubicFocus);
+  $("cubicX").value = p.x;
+  $("cubicY").value = p.y;
+  $("cubicZ").value = p.z;
+}
+
+// ============================ drag (wrap pan / sphere rotate) ============================
+canvas.addEventListener("mousedown", (ev) => {
+  if (layout && (layout.type === "torus" || layout.type === "tri_torus")) {
+    dragging = true; didDrag = false;
+    dragStart = {x: ev.clientX, y: ev.clientY, px: pan.x, py: pan.y};
+  } else if (layout && (layout.type === "robinson" || layout.type === "cubic")) {
+    dragging = true; didDrag = false;
+    dragStart = {x: ev.clientX, y: ev.clientY, yaw: rotYaw, pitch: rotPitch};
+  }
+});
+canvas.addEventListener("mousemove", (ev) => {
+  if (!dragging) return;
+  const dx = ev.clientX - dragStart.x, dy = ev.clientY - dragStart.y;
+  if (Math.abs(dx) + Math.abs(dy) > 4) didDrag = true;
+  if (layout.type === "robinson" || layout.type === "cubic") {
+    rotYaw = dragStart.yaw + dx * 0.01;
+    rotPitch = dragStart.pitch + dy * 0.01;
+    if (layout.type === "robinson") {
+      rotPitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, rotPitch));
+      recomputeRobinson();
+    }
+    render();
+    return;
+  }
+  pan.x = dragStart.px + dx;
+  pan.y = dragStart.py + dy;
+  render();
+});
+canvas.addEventListener("mouseup", () => { dragging = false; });
+canvas.addEventListener("mouseleave", () => { dragging = false; });
+
+canvas.addEventListener("click", async (ev) => {
+  if (didDrag) { didDrag = false; return; }
+  const {x, y} = canvasPos(ev);
+  if (layout && layout.type === "cubic") {
+    const idx = hitVertex(x, y);
+    if (idx < 0) return;
+    setCubicFocus(idx);
+    return;
+  }
+  if (replayMode || !currentIsHuman()) return;
+  const idx = hitVertex(x, y);
+  if (idx < 0 || S.occupancy[idx] !== 0) return;
+  try {
+    const r = await post("/api/human", {vertex: idx});
+    S = r.state;
+    render();
+  } catch (e) { alert("非法着法：" + e.message); }
+});
+
+// ============================ UI events ============================
+$("numPlayers").addEventListener("change", renderPlayerRows);
+$("rulesSel").addEventListener("change", async () => {
+  syncRulesUi();
+  if ($("graphSel").value) await loadGraph($("graphSel").value);
+  render();
+});
+$("graphSel").addEventListener("change", async () => {
+  await loadGraph($("graphSel").value);
+  render();
+});
+$("btnStart").addEventListener("click", newGame);
+$("btnSetup").addEventListener("click", showSetup);
+$("btnCloseSetup").addEventListener("click", hideSetup);
+
+$("btnPass").addEventListener("click", async () => {
+  if (replayMode || !currentIsHuman()) return;
+  try { const r = await post("/api/human", {vertex: null}); S = r.state; render(); }
+  catch (e) { alert(e.message); }
+});
+$("btnConfirm").addEventListener("click", async () => {
+  if (replayMode || !currentIsHuman() || layout.type !== "cubic" || cubicFocus == null) return;
+  if (S.occupancy[cubicFocus] !== 0) return;
+  try {
+    const r = await post("/api/human", {vertex: cubicFocus});
+    S = r.state;
+    render();
+  } catch (e) { alert("非法着法：" + e.message); }
+});
+$("btnCancel").addEventListener("click", () => {
+  if (!layout || layout.type !== "cubic") return;
+  setCubicFocus(null);
+});
+for (const id of ["cubicX", "cubicY", "cubicZ"]) {
+  $(id).addEventListener("change", applyCubicCoordInputs);
+  $(id).addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); applyCubicCoordInputs(); }
+  });
+}
+window.addEventListener("keydown", (ev) => {
+  if (!layout || layout.type !== "cubic") return;
+  if (!$("setupOverlay").classList.contains("hidden")) return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing) return;
+  const t = ev.target;
+  const inCubic = t && (t.id === "cubicX" || t.id === "cubicY" || t.id === "cubicZ");
+  if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA") && !inCubic) return;
+  const k = ev.key.toLowerCase();
+  const map = {w: ["x", 1], s: ["x", -1], a: ["z", 1], d: ["z", -1], q: ["y", 1], e: ["y", -1]};
+  const step = map[k];
+  if (!step) return;
+  ev.preventDefault();
+  cubicNudge(step[0], step[1]);
+});
+
+$("btnAuto").addEventListener("click", toggleAuto);
+$("btnReplay").addEventListener("click", () => setReplay(!replayMode));
+$("btnPrev").addEventListener("click", () => { if (replayMode && replayPtr > 0) { replayPtr--; render(); } });
+$("btnNext").addEventListener("click", () => { if (replayMode && replayPtr < S.history.length) { replayPtr++; render(); } });
+$("btnOvOff").addEventListener("click", () => setOverlay("off"));
+$("btnOvPol").addEventListener("click", () => setOverlay("policy"));
+$("btnOvOwn").addEventListener("click", () => setOverlay("own"));
+
+// ============================ boot ============================
+(async function init() {
+  await loadGraphs();
+  syncRulesUi();
+  await loadGraph($("graphSel").value);
+  updateAutoBtn();
+  render();
+})();
+</script>
+</body>
+</html>
