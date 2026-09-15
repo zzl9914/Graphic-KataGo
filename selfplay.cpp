@@ -211,10 +211,8 @@ std::vector<Sample> play_one_game(std::shared_ptr<const Graph> graph,
     int n_s = static_cast<int>(samples.size());
     for (int i = 0; i < n_s; i++) {
         auto [lead, own] = score_lead_and_ownership(fr, samples[i].me, n, num_players);
-        float target = lead;
-        if (cfg.value_target == "q") target = samples[i].q;
-        else if (cfg.value_target == "mix")
-            target = cfg.q_lambda * lead + (1.f - cfg.q_lambda) * samples[i].q;
+        // mix: q_lambda weights Monte-Carlo z (lead); 1-q_lambda weights root Q
+        float target = cfg.q_lambda * lead + (1.f - cfg.q_lambda) * samples[i].q;
         Sample s;
         s.features = samples[i].X;
         s.legal_mask = samples[i].mask;

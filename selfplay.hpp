@@ -29,8 +29,7 @@ struct SelfPlayConfig {
     float temperature = 1.0f;
     int max_moves = 0;
     int batch_size = 32;
-    std::string value_target = "mc";
-    float q_lambda = 0.5f;
+    float q_lambda = 0.5f;  // mix: weight of MC z; 1-q_lambda weights root Q
     bool randomize_sim = true;
     uint32_t rng_seed = 0;
     Rules rules = Rules::GraphGo;
