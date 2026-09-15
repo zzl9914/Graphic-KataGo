@@ -45,7 +45,7 @@ CUDA 版 `torch` 不在普通 PyPI 里，主源仍用清华，轮子从 PyTorch 
 python -m pip install torch --index-url https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
-Windows 入口钉死 **Python 3.14**（缺则 PATH 上的 `python`，须为 3.14 非 free-threading）。不要用 `py -3` 或 3.13：扩展是 `gkt_native.cp314-win_amd64.pyd`。若 `cpp/build.py` 报 `io.h`/`rc.exe` 找不到，见 [`algorithm.md`](algorithm.md) §9。
+Windows 入口钉死 **Python 3.14**（缺则 PATH 上的 `python`，须为 3.14 非 free-threading）。不要用 `py -3` 或 3.13：扩展是 `gkt_native.cp314-win_amd64.pyd`。编译 native：`python cpp/_build_with_sdk.py`，再 `python cpp/_deploy_pyd.py`（见 [`algorithm.md`](algorithm.md) §9）。
 
 ```bash
 python cpp/build.py
@@ -64,7 +64,7 @@ python web_ui/server.py --port 8765 --device cpu
 
 `(features, legal_mask, policy, me, score_lead, ownership, q, opp_policy, opp_weight, future, lead, weight)`
 
-- `score_lead`：不含贴目的 \((k\cdot s_{\mathrm{me}}-S)/((k-1)n)\)（二人即 \((\text{我}-\text{对方})/n\)）。`--value-target` 为 `q`/`mix` 时这一槽是 Q 或混合（belief 仍用下面的 `lead`）
+- `score_lead`：不含贴目的 \((k\cdot s_{\mathrm{me}}-S)/((k-1)n)\)（二人即 \((\text{我}-\text{对方})/n\)）。这一槽写的是 mix 目标 \(\lambda\cdot\mathrm{lead}+(1-\lambda)\cdot Q\)（belief 仍用下面的 `lead`）
 - `ownership[i]\in[-1,1]`：终局该点从 `me` 视角的归属
 - `q`：该步根节点 MCTS Q（与 lead 同量纲），给 stdev 头
 - `opp_policy`：下一手（下一家）的访问分布；最后一步 `opp_weight=0`
@@ -80,11 +80,11 @@ python web_ui/server.py --port 8765 --device cpu
 
 | | 蒸馏教师 | 自对弈学生 |
 |---|---|---|
-| 来源 | KataGo `scoreLead / n`（查询 `komi: 0`、`tromp-taylor`，`SIDETOMOVE`） | `finalize` 后的图围棋 `score_lead`，或与根 Q 混合 |
-| 含义 | 强教师搜索下的**期望**终局差 | 学生这一局的**实现值** \(z\)，或 \(\lambda z+(1-\lambda)Q\) |
+| 来源 | KataGo `scoreLead / n`（查询 `komi: 0`、`tromp-taylor`，`SIDETOMOVE`） | `finalize` 后的图围棋 `score_lead` 与根 Q 的 mix |
+| 含义 | 强教师搜索下的**期望**终局差 | \(\lambda z+(1-\lambda)Q\)（\(z\) 是这一局实现值） |
 | 噪声 | 很小 | 大（学生棋 + 随机撒子开局 + 截断） |
 
-网络头是 `tanh` 输出，学的就是这个尺度。差在估计方式（期望 vs 实现），不在单位。围棋主线用 `--value-target mix --q-lambda 0.5`，让目标更接近「搜索期望」，而不是纯 MC 抽奖。不要一上来 `--value-target q`：value 若还贴 0，纯 Q 会自举锁死。
+网络头是 `tanh` 输出，学的就是这个尺度。差在估计方式（期望 vs 实现），不在单位。自对弈固定 mix，`--q-lambda` 默认 0.5，让目标更接近「搜索期望」，而不是纯 MC 抽奖。不要把 \(\lambda\) 设成 0：value 若还贴 0，纯 Q 会自举锁死。
 
 ---
 
@@ -112,7 +112,7 @@ python web_ui/server.py --port 8765 --device cpu
 | 图 | 只训 `0`（19×19） |
 | 轮次 | `--rounds 20`，无 `--infinite`，然后停止 |
 | 权重 | `--value-weight 30 --own-weight 5` |
-| 价值目标 | `--value-target mix --q-lambda 0.5` |
+| 价值目标 | mix（`--q-lambda 0.5`） |
 | Arena | **关**（`--no-arena`）。此阶段要让 value/own 在学生自对弈上动起来；回滚会丢掉刚学到的 value |
 | replay | `--buffer-drop-from-round 21`（20 轮内不丢） |
 | 快照 | `--model-snapshot-rounds 25` |
@@ -140,7 +140,7 @@ Windows `.bat` 里 `if (...)` 块中的 `echo` **不能写裸括号**（会被�
 | 图 | 默认训练图（排除 oversized `2`/`6` 与五子棋 `G*`） |
 | 轮次 | `--infinite` |
 | 权重 | `--value-weight 30 --own-weight 5` |
-| 价值目标 | `--value-target mix --q-lambda 0.5` |
+| 价值目标 | mix（`--q-lambda 0.5`） |
 | Arena | **开**（默认） |
 | replay | `--buffer-drop-from-round 5` |
 | 温度 | `--temperature 0.1` |
@@ -176,7 +176,7 @@ python gkt_elo.py --models-dir ../models --sim 100 --games 2 --device cpu
 
 ## 6. 从 0 对照
 
-`gkt_train_gpu.py` / `gkt_train_cpu.py` 也可以随机初始化、不 `--resume`。这是命题的理论完备形态，单卡不可行，只留 `M0`（7×7、`--no-arena`）作 sanity gate。默认 CLI 的 `--value-weight 1 --own-weight 1 --value-target mc --temperature 1.0` 是这条对照线的底；围棋主线 bat 会改写成 30/5、mix、\(\tau=0.1\)。
+`gkt_train_gpu.py` / `gkt_train_cpu.py` 也可以随机初始化、不 `--resume`。这是命题的理论完备形态，单卡不可行，只留 `M0`（7×7、`--no-arena`）作 sanity gate。默认 CLI 的 `--value-weight 1 --own-weight 1 --temperature 1.0` 是这条对照线的底（value 仍是 mix）；围棋主线 bat 会改写成 30/5、\(\tau=0.1\)。
 
 ---
 
@@ -186,8 +186,8 @@ python gkt_elo.py --models-dir ../models --sim 100 --games 2 --device cpu
 |---|---|---|---|---|
 | `--value-weight` | 30 | 30 | 30 | 1 |
 | `--own-weight` | 5 | 5 | 5 | 1 |
-| `--value-target` | 教师 `scoreLead/n`（监督，无此旗标） | `mix` | `mix` | `mc` |
-| `--q-lambda` | — | 0.5（\(z\) 的权重） | 0.5 | 0.5（仅 mix 时有意义） |
+| value 目标 | 教师 `scoreLead/n`（监督） | mix | mix | mix |
+| `--q-lambda` | — | 0.5（\(z\) 的权重） | 0.5 | 0.5 |
 
 报告的 pl / vl / ol **始终未加权**。不要用 3000/25。
 

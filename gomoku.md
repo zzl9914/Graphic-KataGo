@@ -1,7 +1,7 @@
 # Graphic-KataGo · 五子棋
 
 本文件定义本仓库的 **Gomoku（无禁手 / freestyle \(k\) 连珠）** 与 **Anti-Gomoku（反五子棋）**：对象、合法着、终局，以及它们和图围棋、网络实验的关系。  
-图围棋规则只写在 [`rules.md`](rules.md)，不因本节改写。实现见 [`implementation.md`](implementation.md) §12。
+图围棋规则只写在 [`rules.md`](rules.md)，不因本节改写。引擎与训练入口见 [`algorithm.md`](algorithm.md) §13、[`training_method.md`](training_method.md) §10。
 
 所有术语按本节定义；实现不得另发明胜负谓词。
 
@@ -167,7 +167,7 @@ MCTS / 自对弈与图围棋同一套调度。终局价值是 \(\{+1,0,-1\}\)（
 
 ## 8. 训练入口
 
-自对弈学下棋（与图围棋同一套 trainer，`--rules gomoku` 或 `antigomoku`）。手数上限固定为 \(n\)，不用图围棋的 `--min-moves` / `--max-move-factor` / `--curriculum-rounds`。
+自对弈学下棋（与图围棋同一套 trainer，`--rules gomoku` 或 `antigomoku`）。手数上限固定为 \(n\)，不用图围棋的 `--min-moves` / `--max-move-factor` / `--curriculum-rounds`。旗标总表见 [`training_method.md`](training_method.md) §10。
 
 默认轮训图（内部键；UI 别名）：`0`（G19）、`0.5`（G7）、`1`、`3`、`G9`、`G15`、`G7d`、`G9d`。不含 `2`（G61）。每轮打乱图顺序。SGD 与 Arena/UI 搜索按网络分派顶点重编号——GNN / 1DCNN / MLP 随机 \(S_n\)（GNN 同时置换邻接），2DCNN 走 grid2d 棋盘对称 D4/Klein/torus。MCTS 打乱合法着顺序。
 

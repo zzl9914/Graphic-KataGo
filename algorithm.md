@@ -21,7 +21,7 @@
 | 函数 / 方法 / 变量 | `snake_case` | `play_one_game`, `n_simulations` |
 | 模块内私有 | 单下划线前缀 | `_selfplay_worker` |
 | 常量 | `UPPER_SNAKE` | `BLACK`, `MASK_VALUE`, `SCORE_BINS` |
-| CLI | kebab-case | `--selfplay-batch`, `--value-target` |
+| CLI | kebab-case | `--selfplay-batch`, `--q-lambda` |
 | 文档互引 | ``ref/*.md``、``scr/*.py`` | 例如 ``ref/rules.md`` |
 
 **网络鸭子接口**（四种网络共用）：
@@ -141,7 +141,7 @@ MCTS 用 policy + value(lead) + stdev（加权备份、方差缩放 cPUCT）。�
 | 头 | 目标 | 损失（权重） |
 |---|---|---|
 | policy | 剪枝后的访问分布，长度 \(n+1\)，下标 \(n\) 为虚手维（五子棋该维 mask 为 0） | 按 surprise 加权的 CE |
-| value | `score_lead`，可选 `mc` / `q` / `mix` | MSE（tanh 前向；反向雅可比 \(\max(1-\tanh^2, 0.2)\)） |
+| value | mix：\(\lambda\cdot\mathrm{lead}+(1-\lambda)\cdot Q\) | MSE（tanh 前向；反向雅可比 \(\max(1-\tanh^2, 0.2)\)） |
 | ownership | 终局每点归属 | 同上 |
 | opp policy | 下一手（下一家）的访问分布 | CE × 0.25，末手权重 0 |
 | soft policy | \(\pi^{1/T}\)，\(T=4\)，合法着上再归一 | CE × 0.15 |
@@ -149,7 +149,7 @@ MCTS 用 policy + value(lead) + stdev（加权备份、方差缩放 cPUCT）。�
 | stdev | \(\lvert\mathrm{lead}-Q\rvert\) | MSE × 0.15（softplus 前向，反向 \(\max(\sigma, 0.2)\)） |
 | futurepos | 约 4 个决策后的占子 | MSE × 0.25（tanh 前向，反向同 value） |
 
-`--value-target`：`mc` 终局 lead；`q` 根节点 Q（同一量纲）；`mix` 为 \(\lambda\cdot\mathrm{lead}+(1-\lambda)\cdot Q\)（`--q-lambda` 是 **MC z 的权重**，默认 0.5）。belief 始终用终局 `lead`。value / ownership / futurepos / stdev 的末层权为零。日志 vloss / oloss 仍是输出空间的 MSE。围棋主线用哪个 target、value/own 乘多少，见 [`training_method.md`](training_method.md) §7。
+自对弈 value 一律是 mix：\(\lambda\cdot\mathrm{lead}+(1-\lambda)\cdot Q\)（`--q-lambda` 是 **MC z 的权重**，默认 0.5）。belief 始终用终局 `lead`。value / ownership / futurepos / stdev 的末层权为零。日志 vloss / oloss 仍是输出空间的 MSE。value/own 损失乘多少，见 [`training_method.md`](training_method.md) §7。
 
 加载权重必须键齐全：GPU `load_state_dict(..., strict=True)`，CPU 按 `state_dict` 精确匹配。checkpoint 必须带 `net_type`（GPU `.pt`）或 `_net_type`（CPU `.npz`），以及人数 `num_players` / `_num_players`；\(F=\texttt{feature_dim}(k)\)。缺键或 \(F\) 不符则拒载。
 
@@ -204,7 +204,7 @@ MCTS 用 policy + value(lead) + stdev（加权备份、方差缩放 cPUCT）。�
 
 因此：瓶颈在 GPU 叶子与注意力 \(n^2\)；必须在 **GPU device** 上 profile；提速路径是多卡各跑 worker，或改线性/稀疏注意力。
 
-`GktTrainer`：C++ 生成样本；GNN/2DCNN 叶子默认 `maybe_script_infer`（`jit.trace`，优先 `check_trace=True`，再用随机 batch 对照 eager；`freeze` 通过对照才采用）。失败回退 eager。主进程 `train_on_batch` → `get_weights` 广播。构建：`python cpp/build.py`（**若报 `io.h`/`rc.exe` 找不到**，用 `python cpp/_build_with_sdk.py` 注入 VS 的 `ScopeCppSDK` include/lib/PATH，再 `python cpp/_deploy_pyd.py` 复制 `gkt_native.*.pyd` 到 `scr/`；`scr/` 的旧 pyd 若被在跑的训练进程占用，需先停进程再复制）。
+`GktTrainer`：C++ 生成样本；GNN/2DCNN 叶子默认 `maybe_script_infer`（`jit.trace`，优先 `check_trace=True`，再用随机 batch 对照 eager；`freeze` 通过对照才采用）。失败回退 eager。主进程 `train_on_batch` → `get_weights` 广播。构建：`python cpp/build.py`；Windows / VS 18 用 `python cpp/_build_with_sdk.py`（会先载入 `vcvars64` 并注入 `ScopeCppSDK`），再 `python cpp/_deploy_pyd.py` 把 `gkt_native.*.pyd` 拷到 `scr/`。`scr/` 里的旧 pyd 若被训练进程占用，需先停再拷。
 
 多机异步闭环（`gkt_dist.py`）见 [`training_method.md`](training_method.md) §8。
 
