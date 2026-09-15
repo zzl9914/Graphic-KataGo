@@ -2,12 +2,12 @@
 
 Search, legal moves, and scoring live in ``cpp/`` (``gkt_native``).
 Network weights live in ``gkt_cpu.py`` / ``gkt_gpu.py``.
-Docs: ``ref/rules.md``, ``ref/gomoku.md``, ``ref/implementation.md``.
+Docs: ``ref/rules.md``, ``ref/gomoku.md``, ``ref/algorithm.md``,
+``ref/training_method.md``.
 
 These helpers (sample packing, replay buffer, aux targets, eval matches) are
-shared by BOTH lines of the project: the main distillation line (``distill.py``
--> ``base/`` 基础培养) and the theoretical from-zero self-play line
-(``gkt_train_*.py``).
+shared by distillation, cultivate2, official cross-graph training, and the
+from-zero M0 gate.
 """
 
 from __future__ import annotations

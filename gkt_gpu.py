@@ -2,7 +2,7 @@
 
 Search and self-play samples: ``cpp/`` via ``gkt.py`` / ``gkt_cpp.py``.
 NumPy nets: ``gkt_cpu.py``. Cross-graph loop: ``gkt_train_gpu.py``.
-Docs: ``ref/implementation.md``.
+Docs: ``ref/algorithm.md``, ``ref/training_method.md``.
 """
 
 from __future__ import annotations
@@ -688,6 +688,40 @@ def tagged_num_players(src) -> int:
     return _player_count(src.num_players)
 
 
+def gpu_policy_prefixes(net_type: str):
+    """Parameter-name prefixes of the policy readout (pass shares this Linear)."""
+    if gpu_net_type(net_type) == "2dcnn":
+        return ("policy_conv",)
+    return ("policy_head",)
+
+
+def set_gpu_policy_frozen(net, frozen: bool) -> int:
+    """Freeze or unfreeze the policy readout and rebuild Adam on the rest.
+
+    Gradients still flow through the frozen head into the trunk (the readout
+    weights themselves do not move). Returns how many tensors were frozen.
+    """
+    prefixes = gpu_policy_prefixes(net.net_type)
+    n_frozen = 0
+    for name, p in net.named_parameters():
+        is_pol = any(name == pref or name.startswith(pref + ".")
+                     for pref in prefixes)
+        if is_pol:
+            p.requires_grad = not frozen
+            if frozen:
+                n_frozen += 1
+        else:
+            p.requires_grad = True
+    lr = 1e-4
+    wd = 1e-4
+    if getattr(net, "optimizer", None) is not None and net.optimizer.param_groups:
+        lr = float(net.optimizer.param_groups[0]["lr"])
+        wd = float(net.optimizer.param_groups[0].get("weight_decay", 1e-4))
+    trainable = [p for p in net.parameters() if p.requires_grad]
+    net.optimizer = torch.optim.Adam(trainable, lr=lr, weight_decay=wd)
+    return n_frozen
+
+
 def make_net(net_type: str, n_features: Optional[int], hidden_dim: int, n_blocks: int,
              graph: Optional[DiGraph] = None, device: str = "cpu",
              lr: float = 1e-3, attn_layer: int = 8, n_heads: int = 4,
@@ -698,7 +732,7 @@ def make_net(net_type: str, n_features: Optional[int], hidden_dim: int, n_blocks
     ``zero_value_heads=False`` leaves value/own heads at their random init —
     required for supervised distillation, where the zero init collapses them.
     ``value_weight`` / ``own_weight`` scale the SGD terms (reported losses stay
-    unweighted). Distilled Go self-play uses the same ratios as ``distill.py``.
+    unweighted). Go self-play bats pass the same 30 / 5 as distill stage 1.
     """
     net_type = gpu_net_type(net_type)
     np_ = _player_count(num_players)
@@ -1054,7 +1088,8 @@ class GktTrainer:
                  rules: str = "go",
                  win_length: int = 5,
                  value_weight: float = 1.0,
-                 own_weight: float = 1.0):
+                 own_weight: float = 1.0,
+                 freeze_policy: bool = False):
         self.graph = graph
         self.num_players = int(num_players)
         self.n_features = (feature_dim(self.num_players)
@@ -1091,6 +1126,11 @@ class GktTrainer:
                             device=device, lr=lr, num_players=self.num_players,
                             value_weight=value_weight, own_weight=own_weight)
         self.device = device
+        self.freeze_policy = bool(freeze_policy)
+        if self.freeze_policy:
+            n_fr = set_gpu_policy_frozen(self.net, True)
+            self.log(f"policy head frozen ({n_fr} tensors); "
+                     f"train trunk + value/own/aux")
 
     def train(self, n_cycles: int = 10, seed: int = 0,
               replay: Optional[List[Tuple]] = None) -> Dict:
@@ -1112,7 +1152,8 @@ class GktTrainer:
                  f"sim={self.n_simulations}, device={self.device}, "
                  f"batch={self.batch_size} steps={self.steps_per_cycle} "
                  f"value_weight={getattr(self.net, 'value_weight', 1.0):g} "
-                 f"own_weight={getattr(self.net, 'own_weight', 1.0):g}")
+                 f"own_weight={getattr(self.net, 'own_weight', 1.0):g}"
+                 f"{' policy=FROZEN' if self.freeze_policy else ''}")
 
         weights = self.net.get_weights()
         # Use 'spawn' on all platforms via mp_context for consistency; the

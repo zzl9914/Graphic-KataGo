@@ -1,4 +1,4 @@
-"""Generate KataGo distillation data (MAIN LINE data pipeline).
+"""Generate KataGo distillation JSONL (pipeline stage 1 data).
 
 Launches ``katago/katago.exe analysis`` and plays self-play games with
 temperature-sampled moves, querying policy / scoreLead / ownership at each

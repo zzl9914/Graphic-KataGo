@@ -1,16 +1,11 @@
-"""KataGo distillation: supervised pretrain of a graph-agnostic net (MAIN LINE).
+"""KataGo distillation: supervised pretrain of a graph-agnostic net.
 
-This is the PRIMARY way we produce a strong graph-agnostic network. It
-pretrains the student net against strong KataGo teacher labels so the value
-head receives a real, discriminative signal from step one — sidestepping the
-"value head collapses to a constant" bootstrap deadlock that blocks from-zero
-self-play on a single small GPU.
+Stage 1 of the Go pipeline (``ref/training_method.md``): pretrain against
+KataGo teacher labels so the value head gets a real signal from step one,
+instead of collapsing under from-zero self-play on a small GPU.
 
-The distilled checkpoint is the **base model** ("基础培养"): a net that already
-has playing strength on the 19x19 grid. All downstream experiments (cross-graph
-weight transfer, ablations, transfer-boundary probing) start from it. From-zero
-self-play (``gkt_train_gpu.py`` / ``gkt_train_cpu.py``) remains as the
-theoretical "compute-abundant" ideal, kept but no longer the current main line.
+Output is the distilled checkpoint (「基础培养」) on 19x19. Next: cultivate2,
+then official cross-graph training. From-zero remains only as M0.
 
 Supported architectures (``--net``):
 
@@ -27,9 +22,9 @@ a trustworthy, well-defined signal for:
     ownership  KataGo ownership (MSE, mapped to mover-relative [-1, 1])
 
 The aux heads (opp / soft / belief / stdev / future) are left at random init;
-they train later during self-play finetune. Distillation runs three stages of
-``--epochs`` each (default 10+10+10). Stage 1 is the original joint loss
-(``policy + 30*value + 5*own``) with **no freeze**. Stages 2–3 freeze the
+they train later during self-play. Distillation runs three stages of
+``--epochs`` each (default 10+10+10). Stage 1 is joint
+``policy + 30*value + 5*own`` with **no freeze**. Stages 2–3 freeze the
 trunk and train own / value alone (Adam lr ×25 / ×100, unweighted MSE).
 
 Input (JSONL, one position per line, already in *gkt vertex order* — see

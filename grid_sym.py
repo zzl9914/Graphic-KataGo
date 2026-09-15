@@ -4,7 +4,7 @@ Permute occupancy, policy, and ownership together. Both search (Arena / UI)
 and training self-play relabel via ``SearchAugNet``: training self-play draws a
 fresh random S_n perm on *every* ``predict_batch`` (i.e. every leaf evaluation
 the net reads), so the net can never latch onto a stable vertex numbering
-("index superstition"). See ``ref/implementation.md``.
+("index superstition"). See ``ref/algorithm.md`` §8.5.
 
 Relabeling is dispatched by net kind (index-superstition defense):
 

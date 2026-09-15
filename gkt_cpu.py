@@ -2,7 +2,7 @@
 
 Pairs with ``gkt_gpu.py`` (no PyTorch here). Search/self-play live in ``cpp/``.
 Cross-graph loop: ``gkt_train_cpu.py``.
-Docs: ``ref/rules.md``, ``ref/gomoku.md``, ``ref/implementation.md``.
+Docs: ``ref/rules.md``, ``ref/gomoku.md``, ``ref/algorithm.md``.
 """
 from __future__ import annotations
 
@@ -387,11 +387,11 @@ class MlpPolicyValueNet:
         self.n_features = self.F
         self.H = hidden_dim
         self.lr = lr
-        # Distillation and distilled-start self-play re-weight value/own
-        # (their MSE is ~1e-2 of the policy CE). Default 1.0 is from-zero /
-        # Gomoku; Go starters pass 3000 / 25 to match distill.py.
+        # Distillation / Go self-play re-weight value/own (MSE is ~1e-2 of
+        # policy CE). Default 1.0 is from-zero and Gomoku; Go bats pass 30 / 5.
         self.value_weight = float(value_weight)
         self.own_weight = float(own_weight)
+        self.freeze_policy = False
         fin = self.F + 1
         self.W1 = (rng.standard_normal((fin, hidden_dim))
                    * math.sqrt(2.0 / fin)).astype(np.float32)
@@ -532,10 +532,11 @@ class MlpPolicyValueNet:
         self.b1 -= lr * db1
         self.W2 -= lr * dW2
         self.b2 -= lr * db2
-        self.Wp -= lr * dWp
-        self.bp -= lr * dbp
-        self.W_pass -= lr * dW_pass
-        self.b_pass -= lr * db_pass
+        if not getattr(self, "freeze_policy", False):
+            self.Wp -= lr * dWp
+            self.bp -= lr * dbp
+            self.W_pass -= lr * dW_pass
+            self.b_pass -= lr * db_pass
         self.W_attn -= lr * dW_attn
         self.b_attn -= lr * db_attn
         self.W_v1 -= lr * dW_v1
@@ -659,6 +660,7 @@ class Cnn1dPolicyValueNet:
         self.lr = lr
         self.value_weight = float(value_weight)
         self.own_weight = float(own_weight)
+        self.freeze_policy = False
         fin = self.F + 1
         self.W_enc = (rng.standard_normal((fin, hidden_dim))
                       * math.sqrt(2.0 / fin)).astype(np.float32)
@@ -841,10 +843,11 @@ class Cnn1dPolicyValueNet:
         self.b_enc -= lr * db_enc
         self.conv_W -= lr * dconv_W
         self.conv_b -= lr * dconv_b
-        self.Wp -= lr * dWp
-        self.bp -= lr * dbp
-        self.W_pass -= lr * dW_pass
-        self.b_pass -= lr * db_pass
+        if not getattr(self, "freeze_policy", False):
+            self.Wp -= lr * dWp
+            self.bp -= lr * dbp
+            self.W_pass -= lr * dW_pass
+            self.b_pass -= lr * db_pass
         self.W_attn -= lr * dW_attn
         self.b_attn -= lr * db_attn
         self.W_v1 -= lr * dW_v1

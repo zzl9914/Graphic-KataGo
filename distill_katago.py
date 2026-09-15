@@ -1,4 +1,4 @@
-"""KataGo -> GKT distillation data prep (part of the MAIN distillation line).
+"""KataGo -> GKT distillation JSONL conversion.
 
 This module turns KataGo's raw analysis-engine output into the JSONL records
 that ``distill.py`` consumes. It is the ONLY place that knows about KataGo's

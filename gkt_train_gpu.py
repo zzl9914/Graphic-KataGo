@@ -7,20 +7,27 @@ over those graphs is one "round"; total = rounds * n_graphs cycles.
 
 The network is parameterized by per-vertex local features (graph-agnostic), so
 the same weights apply to any graph regardless of vertex count — this is the
-transfer/migration path (see ``ref/implementation.md``).
+transfer/migration path (see ``ref/algorithm.md``, ``ref/training_method.md``).
 
-NOTE ON STRATEGY: this from-zero self-play loop is the THEORETICAL line (the
-"compute-abundant" ideal, AlphaZero/KataGo style from random init). The MAIN
-line is distillation: ``distill.py`` pretrains the net against KataGo labels
-into a base model (「基础培养」, a strong graph-agnostic net), and this trainer
-is then used to finetune / transfer those weights via ``--resume``. Do not
-expect this from-zero loop alone to escape uniform random on a single small GPU.
+This trainer is the self-play loop for cultivate2 and official cross-graph
+training (``--resume`` a distilled checkpoint), and also for the from-zero M0
+gate. Do not expect from-zero alone to escape uniform random on a single small
+GPU. Stage flags: ``ref/training_method.md``.
 
-Usage (distilled / strong-start regime, matches ``starter/*.bat``):
+Usage (official Go, matches ``starter/*.bat``):
   python gkt_train_gpu.py --sim 256 --workers 1 --gpw 32 --steps 16 \
-      --lr 1e-4 --value-weight 3000 --own-weight 25 --temperature 0.1 \
+      --lr 1e-4 --value-weight 30 --own-weight 5 --value-target mix \
+      --q-lambda 0.5 --temperature 0.1 \
       --buffer-drop-from-round 5 --device cuda \
       [--rules go|gomoku|antigomoku] [--outdir ../cur_mod_gnn]
+
+Usage (cultivate2, matches ``base/cultivate2_*.bat``):
+  python gkt_train_gpu.py --graphs 0 --rounds 20 --no-arena \
+      --freeze-policy-until-round 10 --value-weight 30 --own-weight 5 \
+      --value-target mix --q-lambda 0.5 \
+      --sim 256 --workers 1 --gpw 32 --steps 16 --lr 1e-4 --temperature 0.1 \
+      --buffer-drop-from-round 21 --model-snapshot-rounds 25 \
+      --device cuda --resume ../base/gnn/new.pt --outdir ../base/cultivate2/gnn
 """
 from __future__ import annotations
 import os
@@ -149,10 +156,13 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--value-weight", type=float, default=1.0,
                     help="SGD weight on value MSE (reported vloss stays unweighted). "
-                         "Distilled Go starters pass 3000 to match distill.py")
+                         "Go pipeline (distill / cultivate2 / official) uses 30")
     ap.add_argument("--own-weight", type=float, default=1.0,
                     help="SGD weight on ownership MSE (reported oloss stays unweighted). "
-                         "Distilled Go starters pass 25 to match distill.py")
+                         "Go pipeline (distill / cultivate2 / official) uses 5")
+    ap.add_argument("--freeze-policy-until-round", type=int, default=0,
+                    help="1-based: freeze the policy readout for rounds 1..N "
+                         "(train trunk + value/own/aux). 0 = never freeze")
     ap.add_argument("--batch-size", type=int, default=64,
                     help="training batch size (GNN n×n attention ~64 max on "
                          "6 GB VRAM; 256 OOMs)")
@@ -307,7 +317,8 @@ def main():
     log(f"=== cross-graph training: rules={args.rules} {len(keys)} graphs "
         f"[{', '.join(keys)}], sim={args.sim}, "
         f"{W.num_players}P F={W.n_features}, "
-        f"device={args.device}, workers={args.workers}, rounds={rounds_str} ===")
+        f"device={args.device}, workers={args.workers}, rounds={rounds_str}, "
+        f"value_target={args.value_target} q_lambda={args.q_lambda:g} ===")
     if krow:
         log(f"{args.rules}: game length cap is n (no Graph-Go move curriculum)")
         ignored = [f for f in ("--min-moves", "--max-move-factor",
@@ -343,6 +354,9 @@ def main():
     log(f"SGD aug: random vertex relabel for all nets; GNN also permutes adj")
     log(f"head weights: value={args.value_weight:g} own={args.own_weight:g} "
         f"(reported pl/vl/ol unweighted)")
+    until = max(0, int(args.freeze_policy_until_round))
+    if until > 0:
+        log(f"policy freeze: rounds 1-{until} freeze readout, then unfreeze")
     log(f"arena: {'ON' if args.arena else 'OFF'} "
         f"(lead threshold {args.arena_lead_threshold:+.4f}, "
         f"{args.arena_games} games/graph/opponent, sim {args.arena_sim}, "
@@ -417,6 +431,9 @@ def main():
     rnd = start_rnd - 1
     while True:
         rnd += 1
+        if until > 0:
+            log(f"round {rnd}: policy readout "
+                f"{'FROZEN (train trunk+value/own/aux)' if rnd <= until else 'UNFROZEN'}")
         # Shuffle graph order each round (seeded by rnd, so resume can rebuild
         # it). Avoids always training early keys more, and avoids a fixed
         # update order becoming a spurious signal under shared weights.
@@ -457,7 +474,8 @@ def main():
                 num_players=W.num_players,
                 progress_file=progress_file,
                 rules=args.rules, win_length=args.win_length,
-                value_weight=args.value_weight, own_weight=args.own_weight)
+                value_weight=args.value_weight, own_weight=args.own_weight,
+                freeze_policy=(until > 0 and rnd <= until))
             # transfer the shared weights into this graph's trainer
             trainer.net.set_weights(W.get_weights())
             replay = load_unused_buffer(args.outdir, key, args.replay_rounds)

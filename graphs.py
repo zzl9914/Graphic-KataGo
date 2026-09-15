@@ -4,7 +4,7 @@ Undirected boards are stored as bidirectional arcs. Weights and features do
 not depend on |V|; adjacency is data for the GNN.
 
 Graph-Go rules: ``ref/rules.md``. Gomoku / Anti-Gomoku (grid win, graph features):
-``ref/gomoku.md``. Layout of this module: ``ref/implementation.md``.
+``ref/gomoku.md``. Graphs table: ``ref/algorithm.md`` §12.
 """
 
 from __future__ import annotations

@@ -10,7 +10,7 @@ Processes only talk through a basedir (and optionally HTTP). They can run on
 one machine or many. Single-machine training is `gkt_train_*.py`.
 
 Usage (from ``scr/``):
-  python gkt_dist.py init --basedir ../dist_run --from ../models/new.pt
+  python gkt_dist.py init --basedir ../dist_run --from ../cur_mod_gnn/new.pt
   python gkt_dist.py selfplay --basedir ../dist_run
   python gkt_dist.py shuffle --basedir ../dist_run
   python gkt_dist.py train --basedir ../dist_run --device cuda

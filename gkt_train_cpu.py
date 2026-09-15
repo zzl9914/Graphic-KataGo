@@ -1,13 +1,22 @@
 """CPU-only cross-graph training.
 
 Same loop as `gkt_train_gpu.py`, nets `--net mlp|1dcnn` (default MLP).
-Docs: ``ref/implementation.md``.
+Docs: ``ref/algorithm.md``, ``ref/training_method.md``.
 
-Usage (distilled / strong-start regime, matches ``starter/*.bat``):
+Usage (official Go, matches ``starter/*.bat``):
   python gkt_train_cpu.py --sim 256 --workers 1 --gpw 32 --steps 16 \
-      --net mlp --hidden 512 --lr 1e-4 --value-weight 3000 --own-weight 25 \
+      --net mlp --hidden 512 --lr 1e-4 --value-weight 30 --own-weight 5 \
+      --value-target mix --q-lambda 0.5 \
       --temperature 0.1 --buffer-drop-from-round 5 --outdir ../cur_mod_mlp
       [--rules go|gomoku|antigomoku]
+
+Usage (cultivate2, matches ``base/cultivate2_*.bat``):
+  python gkt_train_cpu.py --graphs 0 --rounds 20 --no-arena \
+      --freeze-policy-until-round 10 --value-weight 30 --own-weight 5 \
+      --value-target mix --q-lambda 0.5 \
+      --sim 256 --workers 1 --gpw 32 --steps 16 --lr 1e-4 --temperature 0.1 \
+      --buffer-drop-from-round 21 --model-snapshot-rounds 25 \
+      --net mlp --resume ../base/mlp/new.npz --outdir ../base/cultivate2/mlp
 """
 from __future__ import annotations
 
@@ -195,10 +204,13 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--value-weight", type=float, default=1.0,
                     help="SGD weight on value MSE (reported vloss stays unweighted). "
-                         "Distilled Go starters pass 3000 to match distill.py")
+                         "Go pipeline (distill / cultivate2 / official) uses 30")
     ap.add_argument("--own-weight", type=float, default=1.0,
                     help="SGD weight on ownership MSE (reported oloss stays unweighted). "
-                         "Distilled Go starters pass 25 to match distill.py")
+                         "Go pipeline (distill / cultivate2 / official) uses 5")
+    ap.add_argument("--freeze-policy-until-round", type=int, default=0,
+                    help="1-based: freeze the policy readout for rounds 1..N "
+                         "(train trunk + value/own/aux). 0 = never freeze")
     ap.add_argument("--batch-size", type=int, default=64,
                     help="training batch size (per-sample SGD)")
     ap.add_argument("--steps", type=int, default=4,
@@ -340,7 +352,7 @@ def main():
         f"[{', '.join(keys)}], sim={args.sim}, "
         f"workers={args.workers}, net={net_kind}, {net.num_players}P, "
         f"hidden={args.hidden}, rounds={rounds_str}, "
-        f"value_target={args.value_target} ===")
+        f"value_target={args.value_target} q_lambda={args.q_lambda:g} ===")
     if krow:
         log(f"{args.rules}: game length cap is n (no Graph-Go move curriculum)")
         ignored = [f for f in ("--min-moves", "--max-move-factor",
@@ -376,6 +388,9 @@ def main():
     log("SGD aug: random vertex relabel (MLP and 1DCNN)")
     log(f"head weights: value={args.value_weight:g} own={args.own_weight:g} "
         f"(reported pl/vl/ol unweighted)")
+    until = max(0, int(args.freeze_policy_until_round))
+    if until > 0:
+        log(f"policy freeze: rounds 1-{until} freeze readout, then unfreeze")
     log(f"arena: {'ON' if args.arena else 'OFF'} "
         f"(lead threshold {args.arena_lead_threshold:+.4f}, "
         f"{args.arena_games} games/graph/opponent, sim {args.arena_sim}, "
@@ -451,6 +466,12 @@ def main():
         rnd = start_rnd - 1
         while True:
             rnd += 1
+            want_freeze = until > 0 and rnd <= until
+            prev_freeze = bool(getattr(net, "freeze_policy", False))
+            net.freeze_policy = want_freeze
+            if until > 0 and (rnd == start_rnd or prev_freeze != want_freeze):
+                log(f"round {rnd}: policy readout "
+                    f"{'FROZEN (train trunk+value/own/aux)' if want_freeze else 'UNFROZEN'}")
             # Shuffle graph order each round (seeded by rnd, so resume can rebuild
             # it). Same as gkt_train_gpu.py.
             round_keys = list(keys)
