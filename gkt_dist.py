@@ -263,7 +263,6 @@ def _selfplay_job(job: Dict) -> Tuple[str, List[Tuple]]:
         g, net, n_simulations=int(run["sim"]),
         max_moves=int(job.get("max_moves") or _max_moves(run, len(g.vertices))),
         batch_size=int(run.get("selfplay_batch", 64)),
-        value_target=run.get("value_target", "mc"),
         q_lambda=float(run.get("q_lambda", 0.5)),
         log_fn=lambda *_: None,
         rules=str(run.get("rules", "go")),
@@ -351,7 +350,6 @@ def cmd_init(args) -> None:
         "graphs": graphs,
         "sim": int(args.sim),
         "selfplay_batch": int(args.selfplay_batch),
-        "value_target": args.value_target,
         "q_lambda": float(args.q_lambda),
         "n_features": n_features,
         "num_players": npl,
@@ -838,7 +836,6 @@ def cmd_contribute(args) -> None:
             "net_type": task["net_type"],
             "sim": task["sim"],
             "selfplay_batch": int(args.selfplay_batch),
-            "value_target": args.value_target,
             "q_lambda": float(args.q_lambda),
             "rules": task.get("rules", "go"),
             "win_length": int(task.get("win_length", 5)),
@@ -889,7 +886,6 @@ def main() -> None:
                    help="Gomoku k-in-a-row (ignored for Graph-Go)")
     p.add_argument("--sim", type=int, default=800)
     p.add_argument("--selfplay-batch", type=int, default=64)
-    p.add_argument("--value-target", default="mc")
     p.add_argument("--q-lambda", type=float, default=0.5)
     p.add_argument("--hidden", type=int, default=512)
     p.add_argument("--n-blocks", type=int, default=20)
@@ -945,7 +941,6 @@ def main() -> None:
     p.add_argument("--device", default="cpu")
     p.add_argument("--cache", default="")
     p.add_argument("--selfplay-batch", type=int, default=64)
-    p.add_argument("--value-target", default="mc")
     p.add_argument("--q-lambda", type=float, default=0.5)
     p.add_argument("--once", action="store_true")
 

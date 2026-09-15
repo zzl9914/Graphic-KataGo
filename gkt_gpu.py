@@ -1001,7 +1001,6 @@ def _selfplay_worker(graph: DiGraph, weights: Dict[str, np.ndarray],
                      seed: Optional[int], device: str = "cpu",
                      batch_size: int = 32,
                      attn_layer: int = 8, n_heads: int = 4,
-                     value_target: str = "mc",
                      q_lambda: float = 0.5,
                      net_type: str = "gnn",
                      num_players: int = 2,
@@ -1043,7 +1042,7 @@ def _selfplay_worker(graph: DiGraph, weights: Dict[str, np.ndarray],
                             n_simulations=n_simulations,
                             temperature=temperature,
                             max_moves=max_moves, batch_size=batch_size,
-                            value_target=value_target, q_lambda=q_lambda,
+                            q_lambda=q_lambda,
                             rules=rules, win_length=win_length)
     samples: List[Tuple] = []
     for g_i in range(n_games):
@@ -1079,7 +1078,7 @@ class GktTrainer:
                  batch_size: int = 128,
                  selfplay_device: str = "cpu", selfplay_batch: int = 32,
                  attn_layer: int = 8, n_heads: int = 4,
-                 value_target: str = "mc", q_lambda: float = 0.5,
+                 q_lambda: float = 0.5,
                  steps_per_cycle: int = 4, buffer_capacity: int = 200000,
                  max_moves: Optional[int] = None, log_fn=print,
                  net_type: str = "gnn",
@@ -1099,7 +1098,6 @@ class GktTrainer:
         self.n_blocks = n_blocks
         self.attn_layer = attn_layer
         self.n_heads = n_heads
-        self.value_target = value_target
         self.q_lambda = q_lambda
         self.n_workers = n_workers
         self.games_per_worker = games_per_worker
@@ -1175,8 +1173,7 @@ class GktTrainer:
                     self.games_per_worker, self.max_moves,
                     seed + cycle * 1000 + i, self.selfplay_device,
                     self.selfplay_batch, self.attn_layer,
-                    self.n_heads, self.value_target,
-                    self.q_lambda, self.net_type,
+                    self.n_heads, self.q_lambda, self.net_type,
                     self.num_players,
                     worker_progress_path(self.progress_file, i),
                     self.progress_file,

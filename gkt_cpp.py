@@ -19,7 +19,8 @@ def require_native():
         import gkt_native as native
     except ImportError as e:
         raise ImportError(
-            "gkt_native is required. From the repo root run: python cpp/build.py"
+            "gkt_native is required. From the repo root run: "
+            "python cpp/_build_with_sdk.py && python cpp/_deploy_pyd.py"
         ) from e
     return native
 
@@ -42,7 +43,7 @@ def py_graph_to_native(graph):
 
 
 def play_one_game(graph, net, n_simulations=800, temperature=1.0, max_moves=None,
-                  batch_size=32, value_target="mc", q_lambda=0.5,
+                  batch_size=32, q_lambda=0.5,
                   randomize_sim=True, seed=0, heartbeat=None,
                   rules="go", win_length=5):
     native = require_native()
@@ -50,6 +51,14 @@ def play_one_game(graph, net, n_simulations=800, temperature=1.0, max_moves=None
     k = int(getattr(net, "num_players", 2))
     mm = 0 if max_moves is None else int(max_moves)
     return list(native.play_one_game(
-        ng, net, k, int(n_simulations), float(temperature), mm,
-        int(batch_size), value_target, float(q_lambda), bool(randomize_sim),
-        int(seed), heartbeat, str(rules), int(win_length)))
+        ng, net, k,
+        n_simulations=int(n_simulations),
+        temperature=float(temperature),
+        max_moves=mm,
+        batch_size=int(batch_size),
+        q_lambda=float(q_lambda),
+        randomize_sim=bool(randomize_sim),
+        seed=int(seed),
+        heartbeat=heartbeat,
+        rules=str(rules),
+        win_length=int(win_length)))

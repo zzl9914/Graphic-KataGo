@@ -209,7 +209,7 @@ def aux_from_sample(sample) -> Dict:
         "opp_w": sample[8],
         "future": sample[9],
         "lead": sample[10],
-        "weight": float(sample[11]) if len(sample) > 11 else 1.0,
+        "weight": float(sample[11]),
     }
 
 
@@ -221,8 +221,7 @@ def stack_aux(batch) -> Dict:
         "opp_w": np.array([s[8] for s in batch], dtype=np.float32),
         "future": np.stack([s[9] for s in batch]),
         "lead": np.array([s[10] for s in batch], dtype=np.float32),
-        "weight": np.array([s[11] if len(s) > 11 else 1.0 for s in batch],
-                           dtype=np.float32),
+        "weight": np.array([s[11] for s in batch], dtype=np.float32),
     }
 
 
@@ -243,8 +242,7 @@ def pack_samples(samples: List[Tuple], graph_key: str,
         "opp_w": np.array([s[8] for s in samples], dtype=np.float32),
         "future": np.stack([s[9] for s in samples]),
         "lead": np.array([s[10] for s in samples], dtype=np.float32),
-        "weight": np.array([s[11] if len(s) > 11 else 1.0 for s in samples],
-                           dtype=np.float32),
+        "weight": np.array([s[11] for s in samples], dtype=np.float32),
         "_graph": np.asarray(graph_key),
     }
     if extra:
@@ -256,7 +254,7 @@ def pack_samples(samples: List[Tuple], graph_key: str,
 
 
 def unpack_samples(data) -> Tuple[str, List[Tuple]]:
-    """Read `pack_samples` bytes or a path. Missing `weight` defaults to 1."""
+    """Read `pack_samples` bytes or a path."""
     if isinstance(data, (str, os.PathLike)):
         z = np.load(data, allow_pickle=False)
     else:
@@ -279,8 +277,7 @@ def unpack_samples(data) -> Tuple[str, List[Tuple]]:
         opp_w = z["opp_w"]
         future = z["future"]
         lead = z["lead"]
-        has_w = "weight" in z.files
-        weight = z["weight"] if has_w else None
+        weight = z["weight"]
         n = X.shape[0]
         samples = []
         for i in range(n):
@@ -288,8 +285,7 @@ def unpack_samples(data) -> Tuple[str, List[Tuple]]:
                 X[i], mask[i], policy[i], int(me[i]),
                 float(value[i]), own[i], float(q[i]),
                 opp[i], float(opp_w[i]), future[i],
-                float(lead[i]),
-                float(weight[i]) if has_w else 1.0,
+                float(lead[i]), float(weight[i]),
             ))
         return graph, samples
     finally:
@@ -306,11 +302,7 @@ def unused_buffer_path(outdir: str, key: str) -> str:
 
 def load_unused_buffer(outdir: str, key: str, n_rounds: int = REPLAY_ROUNDS,
                        cap: Optional[int] = None) -> List[Tuple]:
-    """Unused self-play for this graph. ``n_rounds <= 1`` skips the disk queue.
-
-    Loads ``unused.npz``. If that file is missing, concatenates any
-    ``round*.npz`` in the same folder.
-    """
+    """Unused self-play for this graph. ``n_rounds <= 1`` skips the disk queue."""
     if int(n_rounds) <= 1:
         return []
     path = unused_buffer_path(outdir, key)
@@ -320,17 +312,6 @@ def load_unused_buffer(outdir: str, key: str, n_rounds: int = REPLAY_ROUNDS,
             _, rows = unpack_samples(path)
         except (OSError, ValueError, KeyError, TypeError):
             rows = []
-    else:
-        folder = os.path.join(outdir, "replay", _replay_key(key))
-        if os.path.isdir(folder):
-            names = sorted(
-                n for n in os.listdir(folder) if re.match(r"round\d+\.npz$", n))
-            for name in names:
-                try:
-                    _, part = unpack_samples(os.path.join(folder, name))
-                    rows.extend(part)
-                except (OSError, ValueError, KeyError, TypeError):
-                    continue
     if cap is not None and int(cap) > 0 and len(rows) > int(cap):
         rows = rows[-int(cap):]
     return rows
@@ -410,29 +391,10 @@ def save_unused_buffer(outdir: str, key: str, samples: List[Tuple],
     return path
 
 
-def drop_legacy_round_npz(outdir: str, key: str) -> int:
-    """Delete ``roundN.npz`` in this graph's replay folder."""
-    folder = os.path.join(outdir, "replay", _replay_key(key))
-    if not os.path.isdir(folder):
-        return 0
-    n = 0
-    for name in os.listdir(folder):
-        if not re.match(r"round\d+\.npz$", name):
-            continue
-        try:
-            os.remove(os.path.join(folder, name))
-            n += 1
-        except OSError:
-            pass
-    return n
-
-
 def buffer_snapshot_path(outdir: str, key: str, rnd: int) -> str:
     """Path of a per-round snapshot of this graph's unused buffer.
 
-    Lives in a dedicated ``snapshots/`` subfolder so it never collides with
-    ``unused.npz`` or the legacy ``round*.npz`` fallback (both of which match
-    ``round\\d+\\.npz$`` only at the top level of the graph's replay folder).
+    Lives in ``snapshots/`` so it never collides with ``unused.npz``.
     """
     return os.path.join(outdir, "replay", _replay_key(key), "snapshots",
                         "round%06d.npz" % int(rnd))
@@ -660,7 +622,7 @@ class GktSelfPlay:
                  n_simulations: int = 800, temperature: float = 1.0,
                  max_moves: int = None,
                  batch_size: int = 32, log_fn=print,
-                 value_target: str = "mc", q_lambda: float = 0.5,
+                 q_lambda: float = 0.5,
                  randomize_sim: bool = True,
                  relabel: bool = True,
                  rules: str = "go", win_length: int = 5):
@@ -670,7 +632,6 @@ class GktSelfPlay:
         self.batch_size = batch_size
         self.temperature = temperature
         self.log = log_fn
-        self.value_target = value_target
         self.q_lambda = q_lambda
         self.randomize_sim = randomize_sim
         self.rules = str(rules)
@@ -701,7 +662,7 @@ class GktSelfPlay:
         return cpp_play(
             self.graph, self.net, n_simulations=self.n_sim,
             temperature=self.temperature, max_moves=self.max_moves,
-            batch_size=self.batch_size, value_target=self.value_target,
+            batch_size=self.batch_size,
             q_lambda=self.q_lambda, randomize_sim=self.randomize_sim,
             seed=random.randrange(1 << 30), heartbeat=heartbeat,
             rules=self.rules, win_length=self.win_length)

@@ -6,14 +6,14 @@ Docs: ``ref/algorithm.md``, ``ref/training_method.md``.
 Usage (official Go, matches ``starter/*.bat``):
   python gkt_train_cpu.py --sim 256 --workers 1 --gpw 32 --steps 16 \
       --net mlp --hidden 512 --lr 1e-4 --value-weight 30 --own-weight 5 \
-      --value-target mix --q-lambda 0.5 \
-      --temperature 0.1 --buffer-drop-from-round 5 --outdir ../cur_mod_mlp
+      --q-lambda 0.5 --temperature 0.1 --buffer-drop-from-round 5 \
+      --outdir ../cur_mod_mlp
       [--rules go|gomoku|antigomoku]
 
 Usage (cultivate2, matches ``base/cultivate2_*.bat``):
   python gkt_train_cpu.py --graphs 0 --rounds 20 --no-arena \
       --freeze-policy-until-round 10 --value-weight 30 --own-weight 5 \
-      --value-target mix --q-lambda 0.5 \
+      --q-lambda 0.5 \
       --sim 256 --workers 1 --gpw 32 --steps 16 --lr 1e-4 --temperature 0.1 \
       --buffer-drop-from-round 21 --model-snapshot-rounds 25 \
       --net mlp --resume ../base/mlp/new.npz --outdir ../base/cultivate2/mlp
@@ -35,7 +35,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from graphs import builtin_graphs, get_builtin, GOMOKU_KEYS, GOMOKU_TRAIN_KEYS, default_train_outdir, RULES_CHOICES, is_k_in_row_rules  # noqa: E402
-from gkt import GktSelfPlay, aux_from_sample, play_eval_match, score_lead, write_graph_round_summary, progress_append, make_move_heartbeat, worker_progress_path, reset_worker_progress, feature_dim, load_unused_buffer, save_unused_buffer, drop_legacy_round_npz, drop_oldest_buffer, curriculum_max_moves, REPLAY_ROUNDS, BUFFER_DROP_FROM_ROUND, BUFFER_SNAPSHOT_ROUNDS, MODEL_SNAPSHOT_ROUNDS, auto_buffer_drop, parse_from_round_map, save_buffer_snapshot, prune_buffer_snapshots, prune_model_snapshots, prune_big_snapshots  # noqa: E402
+from gkt import GktSelfPlay, aux_from_sample, play_eval_match, score_lead, write_graph_round_summary, progress_append, make_move_heartbeat, worker_progress_path, reset_worker_progress, feature_dim, load_unused_buffer, save_unused_buffer, drop_oldest_buffer, curriculum_max_moves, REPLAY_ROUNDS, BUFFER_DROP_FROM_ROUND, BUFFER_SNAPSHOT_ROUNDS, MODEL_SNAPSHOT_ROUNDS, auto_buffer_drop, parse_from_round_map, save_buffer_snapshot, prune_buffer_snapshots, prune_model_snapshots, prune_big_snapshots  # noqa: E402
 from gkt_cpu import (MlpPolicyValueNet, Cnn1dPolicyValueNet,  # noqa: E402
                        save_cpu_net, load_cpu_net, _player_count, cpu_net_type)
 from grid_sym import augment_vertex_batch  # noqa: E402
@@ -65,7 +65,7 @@ def _make_net(net_type, F, H, lr, kernel_size, conv_layers, seed=0,
 # ---------------------------------------------------------------------------
 def _selfplay_worker(graph_key, weights, net_type, F, H, kernel_size, conv_layers,
                      sim, temperature, n_games, max_moves, batch_size,
-                     value_target, q_lambda, seed, num_players=2,
+                     q_lambda, seed, num_players=2,
                      progress_file=None, main_progress_file=None, worker_id=0,
                      rules="go", win_length=5):
     """Run `n_games` self-play games on a CPU copy of the net. Returns samples.
@@ -87,7 +87,7 @@ def _selfplay_worker(graph_key, weights, net_type, F, H, kernel_size, conv_layer
     progress_append(progress_file, f"{tag} net_ready starting games")
     driver = GktSelfPlay(g, net, n_simulations=sim, temperature=temperature,
                             max_moves=max_moves, batch_size=batch_size,
-                            value_target=value_target, q_lambda=q_lambda,
+                            q_lambda=q_lambda,
                             rules=rules, win_length=win_length)
     samples = []
     for g_i in range(n_games):
@@ -267,11 +267,9 @@ def main():
                     help="loop forever, saving a checkpoint after each round")
     ap.add_argument("--resume", default=None,
                     help="path to a previous new.npz (or other .npz) to continue from")
-    ap.add_argument("--value-target", default="mc", choices=["mc", "q", "mix"],
-                    help="score-lead target: mc = final (my stones − others)/n, "
-                         "q = MCTS root Q, mix = blend of both")
     ap.add_argument("--q-lambda", type=float, default=0.5,
-                    help="weight of Monte-Carlo z in 'mix' value target")
+                    help="weight of Monte-Carlo z in the mix value target "
+                         "(1 - q_lambda weights the MCTS root Q)")
     ap.add_argument("--arena", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="after each round, pit the new weights vs a panel of "
@@ -352,7 +350,7 @@ def main():
         f"[{', '.join(keys)}], sim={args.sim}, "
         f"workers={args.workers}, net={net_kind}, {net.num_players}P, "
         f"hidden={args.hidden}, rounds={rounds_str}, "
-        f"value_target={args.value_target} q_lambda={args.q_lambda:g} ===")
+        f"value=mix q_lambda={args.q_lambda:g} ===")
     if krow:
         log(f"{args.rules}: game length cap is n (no Graph-Go move curriculum)")
         ignored = [f for f in ("--min-moves", "--max-move-factor",
@@ -502,8 +500,7 @@ def main():
                 futures = [executor.submit(
                     _selfplay_worker, key, weights, net_kind, F, args.hidden,
                     kernel_size, conv_layers, args.sim, args.temperature, args.gpw,
-                    max_moves, args.selfplay_batch,
-                    args.value_target, args.q_lambda,
+                    max_moves, args.selfplay_batch, args.q_lambda,
                     rnd * 100000 + cycle_no * 1000 + i,
                     net.num_players,
                     worker_progress_path(progress_file, i), progress_file, i,
@@ -573,7 +570,6 @@ def main():
                         log(f"graph {key}: drop {ndrop} oldest unused "
                             f"(round {rnd}, left={len(buffer)})")
                 save_unused_buffer(args.outdir, key, buffer)
-                drop_legacy_round_npz(args.outdir, key)
                 avg_p = float(np.mean(plosses)) if plosses else float("nan")
                 avg_v = float(np.mean(vlosses)) if vlosses else float("nan")
                 dt = time.time() - t0

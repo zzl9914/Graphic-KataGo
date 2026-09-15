@@ -16,15 +16,14 @@ GPU. Stage flags: ``ref/training_method.md``.
 
 Usage (official Go, matches ``starter/*.bat``):
   python gkt_train_gpu.py --sim 256 --workers 1 --gpw 32 --steps 16 \
-      --lr 1e-4 --value-weight 30 --own-weight 5 --value-target mix \
-      --q-lambda 0.5 --temperature 0.1 \
-      --buffer-drop-from-round 5 --device cuda \
+      --lr 1e-4 --value-weight 30 --own-weight 5 --q-lambda 0.5 \
+      --temperature 0.1 --buffer-drop-from-round 5 --device cuda \
       [--rules go|gomoku|antigomoku] [--outdir ../cur_mod_gnn]
 
 Usage (cultivate2, matches ``base/cultivate2_*.bat``):
   python gkt_train_gpu.py --graphs 0 --rounds 20 --no-arena \
       --freeze-policy-until-round 10 --value-weight 30 --own-weight 5 \
-      --value-target mix --q-lambda 0.5 \
+      --q-lambda 0.5 \
       --sim 256 --workers 1 --gpw 32 --steps 16 --lr 1e-4 --temperature 0.1 \
       --buffer-drop-from-round 21 --model-snapshot-rounds 25 \
       --device cuda --resume ../base/gnn/new.pt --outdir ../base/cultivate2/gnn
@@ -50,7 +49,7 @@ from graphs import (builtin_graphs, get_builtin,  # noqa: E402
 from gkt_gpu import (GktTrainer,  # noqa: E402
                        make_net, save_net, load_net, maybe_script_infer,
                        gpu_net_finite)
-from gkt import play_eval_match, score_lead, make_move_heartbeat, write_graph_round_summary, reset_worker_progress, feature_dim, load_unused_buffer, save_unused_buffer, drop_legacy_round_npz, drop_oldest_buffer, curriculum_max_moves, REPLAY_ROUNDS, BUFFER_DROP_FROM_ROUND, BUFFER_SNAPSHOT_ROUNDS, MODEL_SNAPSHOT_ROUNDS, auto_buffer_drop, parse_from_round_map, save_buffer_snapshot, prune_buffer_snapshots, prune_model_snapshots, prune_big_snapshots  # noqa: E402
+from gkt import play_eval_match, score_lead, make_move_heartbeat, write_graph_round_summary, reset_worker_progress, feature_dim, load_unused_buffer, save_unused_buffer, drop_oldest_buffer, curriculum_max_moves, REPLAY_ROUNDS, BUFFER_DROP_FROM_ROUND, BUFFER_SNAPSHOT_ROUNDS, MODEL_SNAPSHOT_ROUNDS, auto_buffer_drop, parse_from_round_map, save_buffer_snapshot, prune_buffer_snapshots, prune_model_snapshots, prune_big_snapshots  # noqa: E402
 
 EXCLUDE = {"2", "6"}  # oversized: 3721 / 6859 vertices. 2 is a post-train grid generalization board, not a train key.
 GRID_KEYS = ("0", "0.5", "1", "2", "3", "G9", "G15", "G7d", "G9d")  # 2 kept for 2DCNN inference/UI; EXCLUDE drops it from training
@@ -247,11 +246,8 @@ def main():
                          "weaker than old (komi-independent)")
     ap.add_argument("--arena-sim", type=int, default=200,
                     help="MCTS simulations per move during Arena evaluation")
-    ap.add_argument("--value-target", default="mc", choices=["mc", "q", "mix"],
-                    help="score-lead target: mc = final (my stones − others)/n, "
-                         "q = MCTS root Q, mix = blend of both")
     ap.add_argument("--q-lambda", type=float, default=0.5,
-                    help="weight of Monte-Carlo z in 'mix' value target "
+                    help="weight of Monte-Carlo z in the mix value target "
                          "(1 - q_lambda weights the MCTS root Q)")
     args = ap.parse_args()
 
@@ -318,7 +314,7 @@ def main():
         f"[{', '.join(keys)}], sim={args.sim}, "
         f"{W.num_players}P F={W.n_features}, "
         f"device={args.device}, workers={args.workers}, rounds={rounds_str}, "
-        f"value_target={args.value_target} q_lambda={args.q_lambda:g} ===")
+        f"value=mix q_lambda={args.q_lambda:g} ===")
     if krow:
         log(f"{args.rules}: game length cap is n (no Graph-Go move curriculum)")
         ignored = [f for f in ("--min-moves", "--max-move-factor",
@@ -469,7 +465,7 @@ def main():
                 max_moves=max_moves,
                 selfplay_device=args.selfplay_device,
                 selfplay_batch=args.selfplay_batch, log_fn=log,
-                value_target=args.value_target, q_lambda=args.q_lambda,
+                q_lambda=args.q_lambda,
                 net_type=W.net_type,
                 num_players=W.num_players,
                 progress_file=progress_file,
@@ -499,7 +495,6 @@ def main():
                         f"(round {rnd}, left={len(unused)})")
             save_unused_buffer(args.outdir, key, unused,
                                cap=getattr(trainer, "buffer_capacity", None))
-            drop_legacy_round_npz(args.outdir, key)
             # pull the updated weights back into the shared net
             if gpu_net_finite(trainer.net):
                 W.set_weights(trainer.net.get_weights())
