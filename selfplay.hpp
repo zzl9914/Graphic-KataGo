@@ -14,7 +14,8 @@ struct Sample {
     std::vector<float> legal_mask;   // n+1
     std::vector<float> policy;       // n+1
     int me = 1;
-    float value = 0.f;
+    float value = 0.f;               // abs (stone lead) SGD target
+    float value_rto = 0.f;           // rto (lead/n) mix; search uses this head
     std::vector<float> ownership;    // n
     float q = 0.f;
     std::vector<float> opp_policy;   // n+1

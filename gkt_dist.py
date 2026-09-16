@@ -6,22 +6,18 @@ Mirrors official KataGo's closed loop (SelfplayTraining.md / `katago contribute`
                  ↑                                              ↓
            contribute clients  ←—— HTTP serve ——←  latest accepted net
 
-Processes only talk through a basedir (and optionally HTTP). They can run on
-one machine or many. Single-machine training is `gkt_train_*.py`.
+Startup, model sharing with local trainers, and HTTP security:
+``ref/training_method.md`` §8. This file is the implementation.
 
-Usage (from ``scr/``):
-  python gkt_dist.py init --basedir ../dist_run --from ../cur_mod_gnn/new.pt
-  python gkt_dist.py selfplay --basedir ../dist_run
-  python gkt_dist.py shuffle --basedir ../dist_run
-  python gkt_dist.py train --basedir ../dist_run --device cuda
-  python gkt_dist.py gate --basedir ../dist_run
-  python gkt_dist.py serve --basedir ../dist_run --port 8877
-  python gkt_dist.py contribute --url http://127.0.0.1:8877
+``serve`` / ``contribute`` are fail-closed: a token is required. ``init``
+stores only ``token_sha256``. Clients upload self-play ``.npz`` only, never
+weights.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import random
@@ -37,7 +33,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gkt import GktSelfPlay, stack_aux, aux_from_sample, feature_dim, pack_samples, unpack_samples  # noqa: E402
+from gkt import GktSelfPlay, stack_aux, aux_from_sample, feature_dim, pack_samples, unpack_samples, VALUE_ABS_WEIGHT_DEFAULT, VALUE_RTO_WEIGHT_DEFAULT, VALUE_CONS_WEIGHT_DEFAULT, set_value_loss_attrs  # noqa: E402
 from graphs import (  # noqa: E402
     builtin_graphs, get_builtin, GOMOKU_KEYS, GOMOKU_TRAIN_KEYS,
     RULES_CHOICES, is_k_in_row_rules, normalize_rules,
@@ -47,10 +43,85 @@ EXCLUDE = {"2", "6"}  # oversized; 2 is a post-train grid generalization board
 GRID_KEYS = ("0", "0.5", "1", "2", "3", "G9", "G15", "G7d", "G9d")  # 2 kept for 2DCNN inference; EXCLUDE drops it from training
 GPU_NETS = ("gnn", "2dcnn")
 CPU_NETS = ("mlp", "1dcnn")
+TOKEN_MIN_CHARS = 16
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+MAX_UPLOAD_SAMPLES = 20000
+_SAFE_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+_MODEL_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.(?:pt|pth|npz)$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _effective_token_sha256(run: Dict, override: Optional[str]) -> str:
+    """SHA-256 hex of the HTTP token. CLI override wins; else run.json."""
+    if override is not None:
+        override = str(override)
+        if not override:
+            return ""
+        if len(override) < TOKEN_MIN_CHARS:
+            raise SystemExit(
+                f"--token must be at least {TOKEN_MIN_CHARS} characters")
+        return _sha256_hex(override)
+    stored = str(run.get("token_sha256") or "")
+    if _SHA256_HEX.match(stored):
+        return stored
+    legacy = str(run.get("token") or "")
+    if legacy:
+        return _sha256_hex(legacy)
+    return ""
+
+
+def _token_matches(header_val: Optional[str], expected_sha256: str) -> bool:
+    if not expected_sha256 or not _SHA256_HEX.match(expected_sha256):
+        return False
+    got = _sha256_hex(header_val or "")
+    return hmac.compare_digest(got, expected_sha256)
+
+
+def _safe_part(s: str, fallback: str = "x") -> str:
+    s = str(s or "").replace("\\", "/").split("/")[-1]
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("._-")[:80]
+    if _SAFE_PART.match(s):
+        return s
+    return fallback
+
+
+def _contained(folder: str, path: str) -> bool:
+    folder = os.path.realpath(folder)
+    path = os.path.realpath(path)
+    sep = os.sep
+    prefix = folder if folder.endswith(sep) else folder + sep
+    return path == folder or path.startswith(prefix)
+
+
+def _safe_join(folder: str, name: str) -> str:
+    if os.path.basename(name) != name or not name:
+        raise ValueError("unsafe filename")
+    folder_r = os.path.realpath(folder)
+    path = os.path.normpath(os.path.join(folder_r, name))
+    if not _contained(folder_r, path):
+        raise ValueError("unsafe path")
+    return path
+
+
+def _safe_model_path(folder: str, name: str) -> Optional[str]:
+    name = os.path.basename(unquote(str(name)))
+    if not _MODEL_FILE.match(name):
+        return None
+    try:
+        path = _safe_join(folder, name)
+    except ValueError:
+        return None
+    if not os.path.isfile(path):
+        return None
+    return path
 
 
 def _is_gpu(net_type: str) -> bool:
@@ -179,9 +250,11 @@ def _list_models(folder: str) -> List[str]:
         return []
     out = []
     for name in os.listdir(folder):
-        ext = os.path.splitext(name)[1].lower()
-        if ext in (".pt", ".pth", ".npz") and not name.endswith(".tmp"):
-            out.append(os.path.join(folder, name))
+        if not _MODEL_FILE.match(name):
+            continue
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            out.append(path)
     out.sort(key=lambda p: os.path.getmtime(p))
     return out
 
@@ -201,10 +274,32 @@ def _atomic_bytes(path: str, data: bytes) -> None:
 def write_selfplay_file(folder: str, samples: List[Tuple], graph_key: str,
                         model_name: str) -> str:
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    name = f"{graph_key}_{model_name}_{stamp}_{os.getpid()}_{uuid.uuid4().hex[:6]}.npz"
-    path = os.path.join(folder, name)
-    _atomic_bytes(path, pack_samples(samples, graph_key, extra={"model": model_name}))
+    gpart = _safe_part(graph_key, "graph")
+    mpart = _safe_part(os.path.splitext(str(model_name))[0], "model")
+    name = f"{gpart}_{mpart}_{stamp}_{os.getpid()}_{uuid.uuid4().hex[:6]}.npz"
+    os.makedirs(folder, exist_ok=True)
+    path = _safe_join(folder, name)
+    _atomic_bytes(path, pack_samples(samples, str(graph_key), extra={"model": mpart}))
     return path
+
+
+def _head_weights_for_run(run: Dict) -> Tuple[float, float, float]:
+    """(value_weight abs, value_rto_weight, own_weight) for this run's rules."""
+    if is_k_in_row_rules(run.get("rules", "go")):
+        return 1.0, 1.0, 1.0
+    return VALUE_ABS_WEIGHT_DEFAULT, VALUE_RTO_WEIGHT_DEFAULT, 5.0
+
+
+def _apply_head_weights(net, run: Dict) -> None:
+    vw, vr, ow = _head_weights_for_run(run)
+    set_value_loss_attrs(
+        net,
+        value_weight=float(run.get("value_weight", vw)),
+        value_rto_weight=float(run.get("value_rto_weight", vr)),
+        own_weight=float(run.get("own_weight", ow)),
+        value_cons_weight=float(run.get("value_cons_weight", VALUE_CONS_WEIGHT_DEFAULT)),
+        rules=str(run.get("rules", "go")),
+    )
 
 
 def load_net_for_run(path: str, run: Dict, graph, device: str):
@@ -230,20 +325,24 @@ def _make_fresh_net(run: Dict, graph, device: str, lr: float):
     nt = run["net_type"]
     if nt in GPU_NETS:
         from gkt_gpu import make_net
-        return make_net(nt, n_features=int(run["n_features"]),
-                        hidden_dim=int(run["hidden"]), n_blocks=int(run["n_blocks"]),
-                        graph=graph, device=device, lr=lr,
-                        attn_layer=int(run["attn_layer"]),
-                        n_heads=int(run["n_heads"]),
-                        num_players=int(run["num_players"]))
-    from gkt_cpu import MlpPolicyValueNet, Cnn1dPolicyValueNet
-    F, H = int(run["n_features"]), int(run["hidden"])
-    k = int(run["num_players"])
-    if nt == "1dcnn":
-        return Cnn1dPolicyValueNet(F, H, kernel_size=int(run.get("kernel_size", 3)),
-                                   n_layers=int(run.get("conv_layers", 20)), lr=lr,
-                                   num_players=k)
-    return MlpPolicyValueNet(F, H, lr=lr, num_players=k)
+        net = make_net(nt, n_features=int(run["n_features"]),
+                       hidden_dim=int(run["hidden"]), n_blocks=int(run["n_blocks"]),
+                       graph=graph, device=device, lr=lr,
+                       attn_layer=int(run["attn_layer"]),
+                       n_heads=int(run["n_heads"]),
+                       num_players=int(run["num_players"]))
+    else:
+        from gkt_cpu import MlpPolicyValueNet, Cnn1dPolicyValueNet
+        F, H = int(run["n_features"]), int(run["hidden"])
+        k = int(run["num_players"])
+        if nt == "1dcnn":
+            net = Cnn1dPolicyValueNet(F, H, kernel_size=int(run.get("kernel_size", 3)),
+                                      n_layers=int(run.get("conv_layers", 20)), lr=lr,
+                                      num_players=k)
+        else:
+            net = MlpPolicyValueNet(F, H, lr=lr, num_players=k)
+    _apply_head_weights(net, run)
+    return net
 
 
 def _selfplay_job(job: Dict) -> Tuple[str, List[Tuple]]:
@@ -343,6 +442,13 @@ def cmd_init(args) -> None:
             f"seed F={n_features} != feature_dim(num_players)={feature_dim(npl)}")
     if krow and npl != 2:
         raise SystemExit(f"{normalize_rules(args.rules)} requires a 2-player seed, got {npl}P")
+    token = str(args.token or "")
+    token_sha = ""
+    if token:
+        if len(token) < TOKEN_MIN_CHARS:
+            raise SystemExit(
+                f"init --token must be at least {TOKEN_MIN_CHARS} characters")
+        token_sha = _sha256_hex(token)
     with open(seed, "rb") as f:
         _atomic_bytes(dest, f.read())
     run = {
@@ -351,6 +457,7 @@ def cmd_init(args) -> None:
         "sim": int(args.sim),
         "selfplay_batch": int(args.selfplay_batch),
         "q_lambda": float(args.q_lambda),
+        "value_cons_weight": VALUE_CONS_WEIGHT_DEFAULT,
         "n_features": n_features,
         "num_players": npl,
         "hidden": int(args.hidden),
@@ -365,7 +472,7 @@ def cmd_init(args) -> None:
         "arena_games": int(args.arena_games),
         "arena_sim": int(args.arena_sim),
         "arena_threshold": float(args.arena_threshold),
-        "token": args.token or "",
+        "token_sha256": token_sha,
         "window_files": int(args.window_files),
         "shuffled_keep": int(args.shuffled_keep),
         "train_batch": int(args.train_batch),
@@ -378,6 +485,10 @@ def cmd_init(args) -> None:
     _log(f"initialized {basedir}")
     _log(f"  net={nt} rules={run['rules']} graphs={','.join(graphs)}")
     _log(f"  seed model → {dest}")
+    if token_sha:
+        _log("  HTTP token stored as sha256 (plaintext not written to run.json)")
+    else:
+        _log("  no HTTP token; serve/contribute will refuse until you pass --token")
     _log("leave the loops unused until you start selfplay/shuffle/train[/serve]")
 
 
@@ -521,6 +632,7 @@ def cmd_train(args) -> None:
     graphs = _graphs_for(run)
     g0 = get_builtin(graphs[0])
     net = load_net_for_run(model, run, g0, device)
+    _apply_head_weights(net, run)
     if hasattr(net, "optimizer"):
         for pg in net.optimizer.param_groups:
             pg["lr"] = lr
@@ -684,6 +796,9 @@ def cmd_gate(args) -> None:
                 _log(f"gate: [{i}/{n_arena}] graph {key} vs accepted: "
                      f"lead {lead / max(1, ng):+.4f} ({ng} games)")
         avg_lead = total_lead / max(total_games, 1)
+        if total_games <= 0:
+            _log("gate: skip (0 games); leaving pending")
+            return
         if avg_lead >= threshold:
             dest = os.path.join(d["models"], os.path.basename(new_path))
             os.replace(new_path, dest)
@@ -704,15 +819,14 @@ def cmd_gate(args) -> None:
 
 class _DistHandler(BaseHTTPRequestHandler):
     basedir = ""
-    token = ""
+    token_sha256 = ""
+    max_upload = MAX_UPLOAD_BYTES
 
     def log_message(self, fmt, *args):
         _log("http " + (fmt % args))
 
     def _ok_auth(self) -> bool:
-        if not self.token:
-            return True
-        return self.headers.get("X-Token", "") == self.token
+        return _token_matches(self.headers.get("X-Token"), self.token_sha256)
 
     def _send(self, code: int, obj, ctype="application/json"):
         if isinstance(obj, (dict, list)):
@@ -732,10 +846,11 @@ class _DistHandler(BaseHTTPRequestHandler):
         d = _dirs(self.basedir)
         path = urlparse(self.path).path
         run = load_run(self.basedir)
+        secret = {"token", "token_sha256"}
         if path in ("/", "/api/status"):
             model = latest_model(d["models"])
             return self._send(200, {
-                "run": {k: run[k] for k in run if k != "token"},
+                "run": {k: run[k] for k in run if k not in secret},
                 "model": os.path.basename(model) if model else None,
                 "sha": _file_sha(model) if model else None,
                 "graphs": _graphs_for(run),
@@ -745,6 +860,8 @@ class _DistHandler(BaseHTTPRequestHandler):
             if model is None:
                 return self._send(503, {"error": "no accepted model"})
             graphs = _graphs_for(run)
+            if not graphs:
+                return self._send(503, {"error": "no graphs"})
             gkey = random.choice(graphs)
             g = get_builtin(gkey)
             return self._send(200, {
@@ -759,14 +876,13 @@ class _DistHandler(BaseHTTPRequestHandler):
                 "win_length": int(run.get("win_length", 5)),
             })
         if path.startswith("/api/model/"):
-            name = os.path.basename(unquote(path[len("/api/model/"):]))
-            fpath = os.path.join(d["models"], name)
-            if not os.path.isfile(fpath):
+            name = unquote(path[len("/api/model/"):])
+            fpath = _safe_model_path(d["models"], name)
+            if fpath is None:
                 return self._send(404, {"error": "model not found"})
             with open(fpath, "rb") as f:
                 body = f.read()
-            ctype = "application/octet-stream"
-            return self._send(200, body, ctype=ctype)
+            return self._send(200, body, ctype="application/octet-stream")
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -775,19 +891,42 @@ class _DistHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path != "/api/games":
             return self._send(404, {"error": "not found"})
-        length = int(self.headers.get("Content-Length", 0))
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            return self._send(411, {"error": "Content-Length required"})
+        try:
+            length = int(raw_len)
+        except ValueError:
+            return self._send(400, {"error": "bad Content-Length"})
+        cap = max(1, int(self.max_upload))
+        if length < 1 or length > cap:
+            return self._send(413, {"error": "body too large"})
         body = self.rfile.read(length)
-        graph = self.headers.get("X-Graph", "")
+        if len(body) != length:
+            return self._send(400, {"error": "truncated body"})
+        graph_hdr = self.headers.get("X-Graph", "")
         model_name = self.headers.get("X-Model", "unknown")
         try:
             gkey, samples = unpack_samples(body)
         except Exception as e:  # noqa: BLE001
             return self._send(400, {"error": f"bad npz: {e}"})
-        if graph and graph != gkey:
+        gkey = str(gkey)
+        if graph_hdr and str(graph_hdr) != gkey:
             return self._send(400, {"error": "graph mismatch"})
+        run = load_run(self.basedir)
+        allowed = set(_graphs_for(run))
+        if gkey not in allowed:
+            return self._send(400, {"error": "graph not in run"})
+        if len(samples) > MAX_UPLOAD_SAMPLES:
+            return self._send(413, {"error": "too many samples"})
+        if not samples:
+            return self._send(400, {"error": "empty upload"})
         d = _dirs(self.basedir)
         os.makedirs(d["selfplay"], exist_ok=True)
-        path_out = write_selfplay_file(d["selfplay"], samples, gkey, model_name)
+        try:
+            path_out = write_selfplay_file(d["selfplay"], samples, gkey, model_name)
+        except ValueError as e:
+            return self._send(400, {"error": str(e)})
         return self._send(200, {"ok": True, "file": os.path.basename(path_out),
                                 "n": len(samples)})
 
@@ -796,38 +935,66 @@ def cmd_serve(args) -> None:
     basedir = os.path.abspath(args.basedir)
     _ensure_dirs(basedir)
     run = load_run(basedir)
-    _DistHandler.basedir = basedir
-    _DistHandler.token = args.token if args.token is not None else run.get("token", "")
+    sha = _effective_token_sha256(run, args.token)
+    if not sha:
+        raise SystemExit(
+            "serve is fail-closed: pass --token "
+            f"(>={TOKEN_MIN_CHARS} chars) or init with --token")
     host = args.host
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        extra = "TLS on" if args.tls_cert else "no TLS"
+        _log("WARNING: non-loopback bind; " + extra
+             + "; token is the only auth; LAN or tunnel only, not the public internet")
+    _DistHandler.basedir = basedir
+    _DistHandler.token_sha256 = sha
+    _DistHandler.max_upload = int(max(1.0, float(args.max_upload_mb)) * 1024 * 1024)
     httpd = HTTPServer((host, int(args.port)), _DistHandler)
-    _log(f"dist server {host}:{args.port} basedir={basedir} "
-         f"(bind 127.0.0.1 unless you pass --host)")
+    if args.tls_cert:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        key = args.tls_key or None
+        ctx.load_cert_chain(args.tls_cert, key)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        _log(f"dist server TLS {host}:{args.port} basedir={basedir}")
+    else:
+        _log(f"dist server {host}:{args.port} basedir={basedir} "
+             f"(bind 127.0.0.1 unless you pass --host)")
     httpd.serve_forever()
 
 
 def cmd_contribute(args) -> None:
     import urllib.request
+    import ssl
 
+    token = str(args.token or "")
+    if len(token) < TOKEN_MIN_CHARS:
+        raise SystemExit(
+            f"contribute --token required (>={TOKEN_MIN_CHARS} characters)")
     url = args.url.rstrip("/")
-    token = args.token or ""
     device = args.device
     cache = os.path.abspath(args.cache or os.path.join(".", "_dist_cache"))
     os.makedirs(cache, exist_ok=True)
+    ctx = None
+    if url.lower().startswith("https://") and args.insecure:
+        ctx = ssl._create_unverified_context()  # noqa: SLF001
+        _log("WARNING: contribute --insecure (TLS certificate not verified)")
 
     def req(path, data=None, headers=None, method=None):
         h = dict(headers or {})
-        if token:
-            h["X-Token"] = token
+        h["X-Token"] = token
         r = urllib.request.Request(url + path, data=data, headers=h, method=method)
-        with urllib.request.urlopen(r, timeout=600) as resp:
+        with urllib.request.urlopen(r, timeout=600, context=ctx) as resp:
             return resp.read(), resp.headers
 
     n_done = 0
     while True:
         raw, _ = req("/api/task")
         task = json.loads(raw.decode("utf-8"))
-        model_name = task["model"]
-        local = os.path.join(cache, model_name)
+        model_name = os.path.basename(str(task["model"]))
+        if not _MODEL_FILE.match(model_name):
+            raise SystemExit(f"server offered unsafe model name {model_name!r}")
+        local = _safe_join(cache, model_name)
         if not os.path.isfile(local) or _file_sha(local) != task["sha"]:
             body, _ = req("/api/model/" + model_name)
             _atomic_bytes(local, body)
@@ -903,7 +1070,9 @@ def main() -> None:
     p.add_argument("--arena-threshold", type=float, default=0.0,
                    help="min average normalized score-lead to accept "
                         "(same units as the self-play trainers; 0.0 = not weaker)")
-    p.add_argument("--token", default="")
+    p.add_argument("--token", default="",
+                   help="HTTP shared secret (>=16 chars). Stored as sha256 in "
+                        "run.json; required later for serve/contribute")
     p.add_argument("--window-files", type=int, default=32)
     p.add_argument("--shuffled-keep", type=int, default=2,
                    help="shuffled packs to keep per graph (train reads the newest)")
@@ -933,16 +1102,26 @@ def main() -> None:
     p.add_argument("--basedir", default="../dist_run")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8877)
-    p.add_argument("--token", default=None)
+    p.add_argument("--token", default=None,
+                   help="HTTP token (>=16 chars). Default: hash in run.json from init")
+    p.add_argument("--max-upload-mb", type=float, default=64,
+                   help="max POST /api/games body (default 64 MiB)")
+    p.add_argument("--tls-cert", default="",
+                   help="optional PEM cert; wraps the socket in TLS 1.2+")
+    p.add_argument("--tls-key", default="",
+                   help="optional PEM key (omit if the cert file already has it)")
 
     p = sub.add_parser("contribute", help="like katago contribute: fetch net, play, upload")
     p.add_argument("--url", required=True)
-    p.add_argument("--token", default="")
+    p.add_argument("--token", default="",
+                   help="same secret as serve / init (>=16 chars, required)")
     p.add_argument("--device", default="cpu")
     p.add_argument("--cache", default="")
     p.add_argument("--selfplay-batch", type=int, default=64)
     p.add_argument("--q-lambda", type=float, default=0.5)
     p.add_argument("--once", action="store_true")
+    p.add_argument("--insecure", action="store_true",
+                   help="HTTPS only: skip TLS certificate verification (self-signed LAN)")
 
     args = ap.parse_args()
     cmds = {

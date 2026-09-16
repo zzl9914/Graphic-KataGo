@@ -21,7 +21,38 @@ from gkt import (  # noqa: E402
     W_OPP_POLICY, W_SOFT_POLICY, W_BELIEF_PDF, W_BELIEF_CDF, W_STDEV, W_FUTURE,
     lead_belief, soft_policy_target, occupancy_with_empty,
     feature_dim, require_feature_dim, SQUASH_JAC_FLOOR,
+    VALUE_CONS_WEIGHT_DEFAULT, value_cons_scale,
 )
+
+
+def _cpu_finite_values(*xs) -> bool:
+    for x in xs:
+        if x is None:
+            continue
+        if isinstance(x, np.ndarray):
+            if x.size and not np.isfinite(x).all():
+                return False
+        else:
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(v):
+                return False
+    return True
+
+
+def cpu_net_finite(net) -> bool:
+    for v in net.__dict__.values():
+        if isinstance(v, np.ndarray) and v.size and not np.isfinite(v).all():
+            return False
+    return True
+
+
+def _cpu_sgd_apply(pairs, lr):
+    lr = np.float32(lr)
+    for p, g in pairs:
+        p -= lr * np.asarray(g, dtype=np.float32)
 
 
 def _load_arrays_strict(obj, d: Dict[str, np.ndarray]):
@@ -63,6 +94,17 @@ def _init_cpu_aux(obj, rng, hidden_dim: int) -> None:
     obj.b_stdev = np.zeros(1, dtype=np.float32)
 
 
+def _init_value_abs(obj, rng, hidden_dim: int, zero_value_heads: bool) -> None:
+    """Linear per-vertex stone-lead head. Sum over n; no tanh."""
+    if zero_value_heads:
+        obj.W_vabs = np.zeros((hidden_dim, 1), dtype=np.float32)
+        obj.b_vabs = np.zeros(1, dtype=np.float32)
+        return
+    s = math.sqrt(2.0 / hidden_dim)
+    obj.W_vabs = (rng.standard_normal((hidden_dim, 1)) * s).astype(np.float32)
+    obj.b_vabs = np.zeros(1, dtype=np.float32)
+
+
 def _cpu_policy_like(h, W, b, W_pass, b_pass, mask, target, weight):
     """CE on a pass-aware policy head. Returns (ce*w, dh, dW, db, dWp, dbp).
 
@@ -91,11 +133,16 @@ def _cpu_policy_like(h, W, b, W_pass, b_pass, mask, target, weight):
 
 
 def _cpu_aux_grads(obj, h, hv, mask, policy, aux):
-    """Aux losses + grads into trunk `h` and pooled `hv`. Also SGD-updates heads."""
+    """Aux losses + grads into trunk ``h`` / pooled ``hv``.
+
+    Returns ``(aloss, dh, d_hv, updates)`` where ``updates`` is
+    ``[(param, grad), ...]`` for the aux heads. Caller applies SGD after a
+    finite check (same contract as the trunk).
+    """
     dh = np.zeros_like(h)
     d_hv = np.zeros_like(hv)
     aloss = 0.0
-    lr = obj.lr * max(float(aux.get("weight", 1.0)), 0.0)
+    updates = []
     mask = np.asarray(mask, dtype=np.float32)
     # opponent next-move policy (legal set differs from the current mask)
     ce, dhi, dW, db, dWp, dbp = _cpu_policy_like(
@@ -103,10 +150,8 @@ def _cpu_aux_grads(obj, h, hv, mask, policy, aux):
         np.ones_like(mask), np.asarray(aux["opp"], np.float32),
         W_OPP_POLICY * float(aux["opp_w"]))
     dh += dhi
-    obj.W_opp -= lr * dW
-    obj.b_opp -= lr * db
-    obj.W_opp_pass -= lr * dWp
-    obj.b_opp_pass -= lr * dbp
+    updates.extend([(obj.W_opp, dW), (obj.b_opp, db),
+                    (obj.W_opp_pass, dWp), (obj.b_opp_pass, dbp)])
     aloss += ce
     # soft policy
     soft = soft_policy_target(policy, mask, SOFT_POLICY_TEMP)
@@ -114,18 +159,16 @@ def _cpu_aux_grads(obj, h, hv, mask, policy, aux):
         h, obj.W_soft, obj.b_soft, obj.W_soft_pass, obj.b_soft_pass,
         mask, soft, W_SOFT_POLICY)
     dh += dhi
-    obj.W_soft -= lr * dW
-    obj.b_soft -= lr * db
-    obj.W_soft_pass -= lr * dWp
-    obj.b_soft_pass -= lr * dbp
+    updates.extend([(obj.W_soft, dW), (obj.b_soft, db),
+                    (obj.W_soft_pass, dWp), (obj.b_soft_pass, dbp)])
     aloss += ce
     # future occupancy
     fut = np.tanh(h @ obj.W_fut + obj.b_fut).reshape(-1)
     tf = np.asarray(aux["future"], dtype=np.float32).reshape(-1)
     d_pre = _dpre_mse(fut, tf, fut.shape[0], W_FUTURE)
     dh += d_pre.reshape(-1, 1) @ obj.W_fut.T
-    obj.W_fut -= lr * (h.T @ d_pre.reshape(-1, 1))
-    obj.b_fut -= lr * np.array([d_pre.sum()], dtype=np.float32)
+    updates.append((obj.W_fut, h.T @ d_pre.reshape(-1, 1)))
+    updates.append((obj.b_fut, np.array([d_pre.sum()], dtype=np.float32)))
     aloss += W_FUTURE * float(np.mean((fut - tf) ** 2))
     # score belief pdf + cdf
     t = lead_belief(float(aux["lead"]))
@@ -145,8 +188,8 @@ def _cpu_aux_grads(obj, h, hv, mask, policy, aux):
         d_cdf_dp[k] = acc
     d_z = W_BELIEF_PDF * (p - t) + W_BELIEF_CDF * (p * (d_cdf_dp - np.dot(p, d_cdf_dp)))
     d_hv += obj.W_belief @ d_z
-    obj.W_belief -= lr * (hv.reshape(-1, 1) * d_z.reshape(1, -1))
-    obj.b_belief -= lr * d_z
+    updates.append((obj.W_belief, hv.reshape(-1, 1) * d_z.reshape(1, -1)))
+    updates.append((obj.b_belief, d_z))
     aloss += W_BELIEF_PDF * pdf + W_BELIEF_CDF * cdf_mse
     # stdev: |lead - q|
     w = float((hv @ obj.W_stdev + obj.b_stdev)[0])
@@ -156,10 +199,10 @@ def _cpu_aux_grads(obj, h, hv, mask, policy, aux):
                         jac=max(1.0 / (1.0 + math.exp(-min(max(w, -40.0), 40.0))),
                                 SQUASH_JAC_FLOOR)))
     d_hv += g * obj.W_stdev.reshape(-1)
-    obj.W_stdev -= lr * (hv.reshape(-1, 1) * g)
-    obj.b_stdev -= lr * np.array([g], dtype=np.float32)
+    updates.append((obj.W_stdev, hv.reshape(-1, 1) * g))
+    updates.append((obj.b_stdev, np.array([g], dtype=np.float32)))
     aloss += W_STDEV * (y - tgt) ** 2
-    return aloss, dh, d_hv
+    return aloss, dh, d_hv, updates
 
 
 def _ensure_batch5(X, mask, policy, value, own):
@@ -204,16 +247,21 @@ def _pvown_forward_batch(obj, h, mask):
     hv = np.maximum(z1, 0.0)
     v = np.tanh(hv @ obj.W_v2 + obj.b_v2).reshape(b)
     own = np.tanh(h @ obj.W_own + obj.b_own).reshape(b, n)
-    return p, legal, hm, a, v_pool, z1, hv, v, own
+    v_abs = (h @ obj.W_vabs + obj.b_vabs).reshape(b, n).sum(axis=1)
+    return p, legal, hm, a, v_pool, z1, hv, v, own, v_abs
 
 
-def _pvown_losses(p, v, own, policy, value, own_t):
-    """Unweighted mean policy CE / value MSE / own MSE (same reduction as GPU)."""
+def _pvown_losses(p, v, own, policy, value, own_t, v_abs=None):
+    """Unweighted mean policy CE / value MSE / own MSE (same reduction as GPU).
+
+    Reported ``vl`` is abs (stone) MSE when ``v_abs`` is passed; else rto MSE.
+    """
     policy = np.asarray(policy, dtype=np.float32).reshape(p.shape)
-    value = np.asarray(value, dtype=np.float32).reshape(v.shape)
+    value = np.asarray(value, dtype=np.float32).reshape(-1)
     own_t = np.asarray(own_t, dtype=np.float32).reshape(own.shape)
     pl = float(np.mean(-np.sum(policy * np.log(p + 1e-9), axis=1)))
-    vl = float(np.mean((v - value) ** 2))
+    pred_v = v if v_abs is None else np.asarray(v_abs, dtype=np.float32).reshape(-1)
+    vl = float(np.mean((pred_v - value) ** 2))
     ol = float(np.mean((own - own_t) ** 2))
     return pl, vl, ol, policy, value, own_t
 
@@ -242,10 +290,13 @@ def _cpu_own_head_grads(obj, h, own, own_t, scale=1.0):
     return dh, [("W_own", obj.W_own, dW_own), ("b_own", obj.b_own, db_own)]
 
 
-def _cpu_value_head_grads(obj, h, a, v_pool, z1, hv, v, value, scale=1.0):
+def _cpu_value_head_grads(obj, h, a, v_pool, z1, hv, v, value, scale=1.0,
+                          d_v_extra=None):
     b, n, hid = h.shape
     jac_v = np.maximum(1.0 - v * v, SQUASH_JAC_FLOOR)
     d_z2 = np.float32(scale) * 2.0 * (v - value) / b * jac_v
+    if d_v_extra is not None:
+        d_z2 = d_z2 + np.asarray(d_v_extra, dtype=np.float32).reshape(b) * jac_v
     dW_v2 = hv.T @ d_z2.reshape(b, 1)
     db_v2 = np.asarray(d_z2.sum(), dtype=np.float32).reshape(1)
     d_hv = d_z2[:, None] * obj.W_v2.reshape(1, -1)
@@ -267,34 +318,91 @@ def _cpu_value_head_grads(obj, h, a, v_pool, z1, hv, v, value, scale=1.0):
     return dh, named
 
 
-def _cpu_distill_from_trunk(obj, h, mask, policy, value, own_t, stage="policy"):
+def _cpu_value_abs_head_grads(obj, h, v_abs, value, scale=1.0, d_v_extra=None):
+    """MSE on summed linear stone-lead. No tanh. ``value`` is the abs target."""
+    b, n, hid = h.shape
+    v_abs = np.asarray(v_abs, dtype=np.float32).reshape(b)
+    value = np.asarray(value, dtype=np.float32).reshape(b)
+    d_v = np.float32(scale) * 2.0 * (v_abs - value) / b
+    if d_v_extra is not None:
+        d_v = d_v + np.asarray(d_v_extra, dtype=np.float32).reshape(b)
+    d_pre = np.broadcast_to(d_v[:, None], (b, n)).astype(np.float32, copy=True)
+    dW = h.reshape(b * n, hid).T @ d_pre.reshape(b * n, 1)
+    db = np.array([d_pre.sum()], dtype=np.float32)
+    dh = d_pre[:, :, None] * obj.W_vabs.reshape(1, 1, hid)
+    return dh, [("W_vabs", obj.W_vabs, dW), ("b_vabs", obj.b_vabs, db)]
+
+
+def _cpu_value_abs_sgd(obj, h, target, scale, d_extra=0.0):
+    """Single-position abs head. ``h`` is ``(n, H)``. Returns (v_abs, dh, dW, db)."""
+    pre = (h @ obj.W_vabs + obj.b_vabs).reshape(-1)
+    v_abs = float(pre.sum())
+    d_pre = np.full(
+        h.shape[0],
+        np.float32(scale) * 2.0 * (v_abs - float(target)) + np.float32(d_extra),
+        dtype=np.float32)
+    dW = h.T @ d_pre.reshape(-1, 1)
+    db = np.array([d_pre.sum()], dtype=np.float32)
+    dh = d_pre.reshape(-1, 1) @ obj.W_vabs.T
+    return v_abs, dh, dW, db
+
+
+def _cpu_cons_dpred(v_abs, v_rto, n_verts, obj, batch=1):
+    """Unweighted cons MSE and dL/dv_abs, dL/dv_rto (already includes wc)."""
+    wc = float(getattr(obj, "value_cons_weight", 0.0))
+    scale = value_cons_scale(n_verts, getattr(obj, "value_cons_mul_n", True))
+    va = np.asarray(v_abs, dtype=np.float32).reshape(-1)
+    vr = np.asarray(v_rto, dtype=np.float32).reshape(-1)
+    err = va - np.float32(scale) * vr
+    cons = float(np.mean(err * err))
+    if wc == 0.0:
+        z = np.zeros_like(err)
+        return cons, z, z
+    g = np.float32(wc) * 2.0 * err / float(batch)
+    return cons, g, g * np.float32(-scale)
+
+
+def _cpu_distill_from_trunk(obj, h, mask, policy, value, own_t, stage="policy",
+                            value_rto=None):
     """Losses + grads for one distill stage. Returns ``(pl, vl, ol, dh, named)``.
 
-    Stage 1 (``policy``) is joint ``pl + vw*vl + ow*ol``: ``named`` holds all
-    three heads and ``dh`` is the trunk gradient. Own / value stages return
-    one unweighted head and ``dh is None`` so the caller skips a frozen trunk.
+    Stage 1 (``policy``) is joint
+    ``pl + vw*abs + vr*rto + wc*cons + ow*own``. Own stage freezes the trunk.
+    Value stage trains both abs and rto heads plus cons. Reported ``vl`` is abs MSE.
     """
-    p, legal, hm, a, v_pool, z1, hv, v, own = _pvown_forward_batch(obj, h, mask)
+    p, legal, hm, a, v_pool, z1, hv, v, own, v_abs = _pvown_forward_batch(
+        obj, h, mask)
     pl, vl, ol, policy, value, own_t = _pvown_losses(
-        p, v, own, policy, value, own_t)
+        p, v, own, policy, value, own_t, v_abs=v_abs)
+    if value_rto is None:
+        raise ValueError("distill requires value_rto")
+    rto_t = np.asarray(value_rto, dtype=np.float32).reshape(v.shape)
     if not (math.isfinite(pl) and math.isfinite(vl) and math.isfinite(ol)):
         return float("nan"), float("nan"), float("nan"), None, None
+    vw = float(getattr(obj, "value_weight", 1.0))
+    vr = float(getattr(obj, "value_rto_weight", 1.0))
+    ow = float(getattr(obj, "own_weight", 1.0))
+    b, n, _hid = h.shape
+    _cons, d_abs_c, d_rto_c = _cpu_cons_dpred(v_abs, v, n, obj, batch=b)
     if stage == "policy":
-        vw = float(getattr(obj, "value_weight", 1.0))
-        ow = float(getattr(obj, "own_weight", 1.0))
         dh_p, named_p = _cpu_policy_head_grads(obj, h, hm, p, policy, legal)
         dh_o, named_o = _cpu_own_head_grads(obj, h, own, own_t, ow)
-        dh_v, named_v = _cpu_value_head_grads(
-            obj, h, a, v_pool, z1, hv, v, value, vw)
-        return pl, vl, ol, dh_p + dh_o + dh_v, named_p + named_o + named_v
+        dh_rto, named_rto = _cpu_value_head_grads(
+            obj, h, a, v_pool, z1, hv, v, rto_t, vr, d_v_extra=d_rto_c)
+        dh_abs, named_abs = _cpu_value_abs_head_grads(
+            obj, h, v_abs, value, vw, d_v_extra=d_abs_c)
+        return (pl, vl, ol, dh_p + dh_o + dh_rto + dh_abs,
+                named_p + named_o + named_rto + named_abs)
     if stage == "own":
         _, named = _cpu_own_head_grads(obj, h, own, own_t, 1.0)
         return pl, vl, ol, None, named
     if stage != "value":
         raise ValueError(f"unknown distill stage {stage!r}")
-    _, named = _cpu_value_head_grads(
-        obj, h, a, v_pool, z1, hv, v, value, 1.0)
-    return pl, vl, ol, None, named
+    _, named_rto = _cpu_value_head_grads(
+        obj, h, a, v_pool, z1, hv, v, rto_t, vr, d_v_extra=d_rto_c)
+    _, named_abs = _cpu_value_abs_head_grads(
+        obj, h, v_abs, value, vw, d_v_extra=d_abs_c)
+    return pl, vl, ol, None, named_rto + named_abs
 
 
 class NumpyAdam:
@@ -379,7 +487,9 @@ class MlpPolicyValueNet:
     def __init__(self, n_features=None, hidden_dim: int = 512,
                  lr: float = 1e-3, seed: int = 0, num_players: int = 2,
                  zero_value_heads: bool = True,
-                 value_weight: float = 1.0, own_weight: float = 1.0):
+                 value_weight: float = 1.0, own_weight: float = 1.0,
+                 value_rto_weight: float = 1.0,
+                 value_cons_weight: float = VALUE_CONS_WEIGHT_DEFAULT):
         rng = np.random.default_rng(seed)
         self.num_players = int(num_players)
         self.F = feature_dim(self.num_players) if n_features is None else int(n_features)
@@ -387,9 +497,10 @@ class MlpPolicyValueNet:
         self.n_features = self.F
         self.H = hidden_dim
         self.lr = lr
-        # Distillation / Go self-play re-weight value/own (MSE is ~1e-2 of
-        # policy CE). Default 1.0 is from-zero and Gomoku; Go bats pass 30 / 5.
         self.value_weight = float(value_weight)
+        self.value_rto_weight = float(value_rto_weight)
+        self.value_cons_weight = float(value_cons_weight)
+        self.value_cons_mul_n = True
         self.own_weight = float(own_weight)
         self.freeze_policy = False
         fin = self.F + 1
@@ -432,6 +543,7 @@ class MlpPolicyValueNet:
             self.W_own = (rng.standard_normal((hidden_dim, 1))
                           * math.sqrt(2.0 / hidden_dim)).astype(np.float32)
             self.b_own = np.zeros(1, dtype=np.float32)
+        _init_value_abs(self, rng, hidden_dim, zero_value_heads)
         _init_cpu_aux(self, rng, hidden_dim)
 
     def forward(self, X: np.ndarray, legal_mask: np.ndarray = None
@@ -496,7 +608,12 @@ class MlpPolicyValueNet:
         v_pool = (h2 * a).sum(axis=0)
         z1 = v_pool @ self.W_v1 + self.b_v1
         hv = np.maximum(z1, 0.0)
-        d_z2 = float(_dpre_mse(value, target_value, weight=self.value_weight))
+        rto_t = float(aux["value_rto"])
+        v_abs = float((h2 @ self.W_vabs + self.b_vabs).reshape(-1).sum())
+        cons, d_abs_c, d_rto_c = _cpu_cons_dpred(v_abs, value, n, self, batch=1)
+        jac_v = np.maximum(1.0 - value * value, SQUASH_JAC_FLOOR)
+        d_z2 = float(_dpre_mse(value, rto_t, weight=self.value_rto_weight)
+                     ) + float(d_rto_c[0]) * float(jac_v)
         dW_v2 = hv.reshape(-1, 1) * d_z2
         db_v2 = np.array([d_z2], dtype=np.float32)
         d_hv = d_z2 * self.W_v2.reshape(-1)
@@ -507,7 +624,11 @@ class MlpPolicyValueNet:
         db_own = np.array([d_pre.sum()], dtype=np.float32)
         dh2 += d_pre.reshape(-1, 1) @ self.W_own.T
         own_mse = float(np.mean((own - to) ** 2))
-        aloss, dh_a, dhv_a = _cpu_aux_grads(self, h2, hv, legal_mask, target_policy, aux)
+        v_abs, dh_abs, dW_vabs, db_vabs = _cpu_value_abs_sgd(
+            self, h2, target_value, self.value_weight, d_extra=float(d_abs_c[0]))
+        dh2 += dh_abs
+        aloss, dh_a, dhv_a, aux_upd = _cpu_aux_grads(self, h2, hv, legal_mask, target_policy, aux)
+        aloss = aloss + float(self.value_cons_weight) * cons
         dh2 += dh_a
         d_hv = d_hv + dhv_a
         d_z1 = d_hv * (z1 > 0)
@@ -528,26 +649,26 @@ class MlpPolicyValueNet:
         dW1 = Xe.T @ dh1
         db1 = dh1.sum(axis=0)
         lr = self.lr * max(float(aux.get("weight", 1.0)), 0.0)
-        self.W1 -= lr * dW1
-        self.b1 -= lr * db1
-        self.W2 -= lr * dW2
-        self.b2 -= lr * db2
-        if not getattr(self, "freeze_policy", False):
-            self.Wp -= lr * dWp
-            self.bp -= lr * dbp
-            self.W_pass -= lr * dW_pass
-            self.b_pass -= lr * db_pass
-        self.W_attn -= lr * dW_attn
-        self.b_attn -= lr * db_attn
-        self.W_v1 -= lr * dW_v1
-        self.b_v1 -= lr * db_v1
-        self.W_v2 -= lr * dW_v2
-        self.b_v2 -= lr * db_v2
-        self.W_own -= lr * dW_own
-        self.b_own -= lr * db_own
         eps = 1e-9
         ce = -np.sum(target_policy * np.log(policy + eps))
-        mse = (value - target_value) ** 2
+        mse = (v_abs - target_value) ** 2
+        pairs = [
+            (self.W1, dW1), (self.b1, db1), (self.W2, dW2), (self.b2, db2),
+            (self.W_attn, dW_attn), (self.b_attn, db_attn),
+            (self.W_v1, dW_v1), (self.b_v1, db_v1),
+            (self.W_v2, dW_v2), (self.b_v2, db_v2),
+            (self.W_own, dW_own), (self.b_own, db_own),
+            (self.W_vabs, dW_vabs), (self.b_vabs, db_vabs),
+        ]
+        if not getattr(self, "freeze_policy", False):
+            pairs.extend([(self.Wp, dWp), (self.bp, dbp),
+                          (self.W_pass, dW_pass), (self.b_pass, db_pass)])
+        pairs.extend(aux_upd)
+        if not _cpu_finite_values(ce, mse, own_mse, aloss,
+                                  *[g for _, g in pairs]):
+            nan = float("nan")
+            return nan, nan, nan, nan
+        _cpu_sgd_apply(pairs, lr)
         return float(ce), float(mse), float(own_mse), float(ce + mse + own_mse + aloss)
 
     def distill_eval_batch(self, X, mask, policy, value, own):
@@ -556,23 +677,25 @@ class MlpPolicyValueNet:
         xe = occupancy_with_empty(X, self.num_players)
         h1 = np.tanh(xe @ self.W1 + self.b1)
         h2 = np.tanh(h1 @ self.W2 + self.b2)
-        p, _legal, _hm, _a, _vp, _z1, _hv, v, opred = _pvown_forward_batch(
+        p, _legal, _hm, _a, _vp, _z1, _hv, v, opred, v_abs = _pvown_forward_batch(
             self, h2, mask)
-        pl, vl, ol, _, _, _ = _pvown_losses(p, v, opred, policy, value, own)
+        pl, vl, ol, _, _, _ = _pvown_losses(
+            p, v, opred, policy, value, own, v_abs=v_abs)
         return pl, vl, ol
 
-    def distill_train_on_batch(self, X, mask, policy, value, own, stage="policy"):
+    def distill_train_on_batch(self, X, mask, policy, value, own, stage="policy",
+                               value_rto=None):
         """Mini-batch Adam on one distill stage (policy / own / value).
 
         Stage 1 jointly updates trunk + policy/value/own heads. Own / value
-        stages freeze the trunk.
+        stages freeze the trunk. Value stage trains abs + rto.
         """
         X, mask, policy, value, own = _ensure_batch5(X, mask, policy, value, own)
         xe = occupancy_with_empty(X, self.num_players)
         h1 = np.tanh(xe @ self.W1 + self.b1)
         h2 = np.tanh(h1 @ self.W2 + self.b2)
         pl, vl, ol, dh2, named = _cpu_distill_from_trunk(
-            self, h2, mask, policy, value, own, stage=stage)
+            self, h2, mask, policy, value, own, stage=stage, value_rto=value_rto)
         if named is None:
             return (float("nan"),) * 4
         if stage == "policy":
@@ -623,7 +746,7 @@ class MlpPolicyValueNet:
         b, n, _hid = h2.shape
         if masks is None:
             masks = np.ones((b, n + 1), dtype=np.float32)
-        p, _legal, _hm, _a, _vp, _z1, _hv, v, _own = _pvown_forward_batch(
+        p, _legal, _hm, _a, _vp, _z1, _hv, v, _own, _vabs = _pvown_forward_batch(
             self, h2, masks)
         return p.astype(np.float32), v.astype(np.float32)
 
@@ -640,14 +763,16 @@ class Cnn1dPolicyValueNet:
     horizontal locality but misses vertical and diagonal edges. Baseline for
     how much the GNN's real graph structure helps vs the two-layer MLP.
 
-    CPU (NumPy) only. Value head matches MLP / GPU (attention pool).
+    CPU (NumPy) only. Value heads match MLP / GPU (attention-pool rto + sum abs).
     """
 
     def __init__(self, n_features=None, hidden_dim: int = 512,
                  kernel_size: int = 3, n_layers: int = 20,
                  lr: float = 1e-3, seed: int = 0, num_players: int = 2,
                  zero_value_heads: bool = True,
-                 value_weight: float = 1.0, own_weight: float = 1.0):
+                 value_weight: float = 1.0, own_weight: float = 1.0,
+                 value_rto_weight: float = 1.0,
+                 value_cons_weight: float = VALUE_CONS_WEIGHT_DEFAULT):
         rng = np.random.default_rng(seed)
         self.num_players = int(num_players)
         self.F = feature_dim(self.num_players) if n_features is None else int(n_features)
@@ -659,6 +784,9 @@ class Cnn1dPolicyValueNet:
         self.pad = kernel_size // 2
         self.lr = lr
         self.value_weight = float(value_weight)
+        self.value_rto_weight = float(value_rto_weight)
+        self.value_cons_weight = float(value_cons_weight)
+        self.value_cons_mul_n = True
         self.own_weight = float(own_weight)
         self.freeze_policy = False
         fin = self.F + 1
@@ -695,6 +823,7 @@ class Cnn1dPolicyValueNet:
             self.W_own = (rng.standard_normal((hidden_dim, 1))
                           * math.sqrt(2.0 / hidden_dim)).astype(np.float32)
             self.b_own = np.zeros(1, dtype=np.float32)
+        _init_value_abs(self, rng, hidden_dim, zero_value_heads)
         _init_cpu_aux(self, rng, hidden_dim)
 
     def _im2col(self, h: np.ndarray) -> np.ndarray:
@@ -796,7 +925,12 @@ class Cnn1dPolicyValueNet:
         v_pool = (h_out * a).sum(axis=0)
         z1 = v_pool @ self.W_v1 + self.b_v1
         hv = np.maximum(z1, 0.0)
-        d_z2 = float(_dpre_mse(value, target_value, weight=self.value_weight))
+        rto_t = float(aux["value_rto"])
+        v_abs = float((h_out @ self.W_vabs + self.b_vabs).reshape(-1).sum())
+        cons, d_abs_c, d_rto_c = _cpu_cons_dpred(v_abs, value, n, self, batch=1)
+        jac_v = np.maximum(1.0 - value * value, SQUASH_JAC_FLOOR)
+        d_z2 = float(_dpre_mse(value, rto_t, weight=self.value_rto_weight)
+                     ) + float(d_rto_c[0]) * float(jac_v)
         dW_v2 = hv.reshape(-1, 1) * d_z2
         db_v2 = np.array([d_z2], dtype=np.float32)
         d_hv = d_z2 * self.W_v2.reshape(-1)
@@ -807,8 +941,12 @@ class Cnn1dPolicyValueNet:
         db_own = np.array([d_pre.sum()], dtype=np.float32)
         dh += d_pre.reshape(-1, 1) @ self.W_own.T
         own_mse = float(np.mean((own - to) ** 2))
-        aloss, dh_a, dhv_a = _cpu_aux_grads(
+        v_abs, dh_abs, dW_vabs, db_vabs = _cpu_value_abs_sgd(
+            self, h_out, target_value, self.value_weight, d_extra=float(d_abs_c[0]))
+        dh += dh_abs
+        aloss, dh_a, dhv_a, aux_upd = _cpu_aux_grads(
             self, h_out, hv, legal_mask, target_policy, aux)
+        aloss = aloss + float(self.value_cons_weight) * cons
         dh += dh_a
         d_hv = d_hv + dhv_a
         d_z1 = d_hv * (z1 > 0)
@@ -837,29 +975,28 @@ class Cnn1dPolicyValueNet:
         dW_enc = Xe.T @ dh
         db_enc = dh.sum(axis=0)
 
-        # SGD update
         lr = self.lr * max(float(aux.get("weight", 1.0)), 0.0)
-        self.W_enc -= lr * dW_enc
-        self.b_enc -= lr * db_enc
-        self.conv_W -= lr * dconv_W
-        self.conv_b -= lr * dconv_b
-        if not getattr(self, "freeze_policy", False):
-            self.Wp -= lr * dWp
-            self.bp -= lr * dbp
-            self.W_pass -= lr * dW_pass
-            self.b_pass -= lr * db_pass
-        self.W_attn -= lr * dW_attn
-        self.b_attn -= lr * db_attn
-        self.W_v1 -= lr * dW_v1
-        self.b_v1 -= lr * db_v1
-        self.W_v2 -= lr * dW_v2
-        self.b_v2 -= lr * db_v2
-        self.W_own -= lr * dW_own
-        self.b_own -= lr * db_own
-
         eps = 1e-9
         ce = -np.sum(target_policy * np.log(policy + eps))
-        mse = (value - target_value) ** 2
+        mse = (v_abs - target_value) ** 2
+        pairs = [
+            (self.W_enc, dW_enc), (self.b_enc, db_enc),
+            (self.conv_W, dconv_W), (self.conv_b, dconv_b),
+            (self.W_attn, dW_attn), (self.b_attn, db_attn),
+            (self.W_v1, dW_v1), (self.b_v1, db_v1),
+            (self.W_v2, dW_v2), (self.b_v2, db_v2),
+            (self.W_own, dW_own), (self.b_own, db_own),
+            (self.W_vabs, dW_vabs), (self.b_vabs, db_vabs),
+        ]
+        if not getattr(self, "freeze_policy", False):
+            pairs.extend([(self.Wp, dWp), (self.bp, dbp),
+                          (self.W_pass, dW_pass), (self.b_pass, db_pass)])
+        pairs.extend(aux_upd)
+        if not _cpu_finite_values(ce, mse, own_mse, aloss,
+                                  *[g for _, g in pairs]):
+            nan = float("nan")
+            return nan, nan, nan, nan
+        _cpu_sgd_apply(pairs, lr)
         return float(ce), float(mse), float(own_mse), float(ce + mse + own_mse + aloss)
 
     def _unpad_grad(self, dcols: np.ndarray, n: int) -> np.ndarray:
@@ -889,12 +1026,14 @@ class Cnn1dPolicyValueNet:
         h = np.tanh(xe @ self.W_enc + self.b_enc)
         for l in range(self.L):
             h = np.tanh(self._conv1d(h, self.conv_W[l], self.conv_b[l]))
-        p, _legal, _hm, _a, _vp, _z1, _hv, v, opred = _pvown_forward_batch(
+        p, _legal, _hm, _a, _vp, _z1, _hv, v, opred, v_abs = _pvown_forward_batch(
             self, h, mask)
-        pl, vl, ol, _, _, _ = _pvown_losses(p, v, opred, policy, value, own)
+        pl, vl, ol, _, _, _ = _pvown_losses(
+            p, v, opred, policy, value, own, v_abs=v_abs)
         return pl, vl, ol
 
-    def distill_train_on_batch(self, X, mask, policy, value, own, stage="policy"):
+    def distill_train_on_batch(self, X, mask, policy, value, own, stage="policy",
+                               value_rto=None):
         """Mini-batch Adam on one distill stage (policy / own / value).
 
         Own / value stages freeze the conv trunk, so im2col backward is skipped.
@@ -909,7 +1048,7 @@ class Cnn1dPolicyValueNet:
             if acts is not None:
                 acts.append(h)
         pl, vl, ol, dh, named = _cpu_distill_from_trunk(
-            self, h, mask, policy, value, own, stage=stage)
+            self, h, mask, policy, value, own, stage=stage, value_rto=value_rto)
         if named is None:
             return (float("nan"),) * 4
         if stage == "policy":
@@ -970,7 +1109,7 @@ class Cnn1dPolicyValueNet:
         b, n, _hid = h.shape
         if masks is None:
             masks = np.ones((b, n + 1), dtype=np.float32)
-        p, _legal, _hm, _a, _vp, _z1, _hv, v, _own = _pvown_forward_batch(
+        p, _legal, _hm, _a, _vp, _z1, _hv, v, _own, _vabs = _pvown_forward_batch(
             self, h, masks)
         return p.astype(np.float32), v.astype(np.float32)
 
@@ -1016,6 +1155,8 @@ def cpu_net_label(net_or_kind) -> str:
 
 
 def save_cpu_net(net, path: str):
+    if not cpu_net_finite(net):
+        raise ValueError("refusing to save non-finite CPU weights")
     kind = cpu_net_type(net)
     np.savez(path,
              _net_type=np.asarray(kind),

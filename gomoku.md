@@ -186,11 +186,11 @@ cur_mod_antigomoku_gnn  cur_mod_antigomoku_mlp  cur_mod_antigomoku_cnn1d  cur_mo
 ```bash
 python cpp/build.py
 cd scr
-python gkt_train_gpu.py --rules gomoku --net gnn --sim 800 --workers 1 --gpw 16 --infinite
-python gkt_train_gpu.py --rules antigomoku --net gnn --sim 800 --workers 1 --gpw 16 --infinite
-python gkt_train_gpu.py --rules gomoku --net 2dcnn --sim 800 --workers 1 --gpw 16
-python gkt_train_cpu.py --rules gomoku --net mlp --sim 800 --workers 1 --gpw 16
-python gkt_train_cpu.py --rules gomoku --net 1dcnn --sim 800 --workers 1 --gpw 16
+python gkt_train_gpu.py --rules gomoku --infinite
+python gkt_train_gpu.py --rules antigomoku --infinite
+python gkt_train_gpu.py --rules gomoku --net 2dcnn --infinite
+python gkt_train_cpu.py --rules gomoku --infinite
+python gkt_train_cpu.py --rules gomoku --net 1dcnn --infinite
 ```
 
 Web UI：规则选「五子棋」或「反五子棋」时列出同一套矩形网格；`0` 显示为 G19，`0.5` 显示为 G7，`2` 显示为 G61。配色：图围棋偏红，五子棋偏绿，反五子棋偏蓝紫。

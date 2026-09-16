@@ -34,7 +34,8 @@ def _env_after_vcvars() -> dict:
     env = os.environ.copy()
     if os.path.isfile(_VCVARS):
         dumped = subprocess.check_output(
-            ["cmd", "/c", f'call "{_VCVARS}" >nul && set'],
+            f'call "{_VCVARS}" >nul && set',
+            shell=True,
             encoding="mbcs",
             errors="replace",
         )

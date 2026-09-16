@@ -8,7 +8,7 @@
 - **2DCNN** 是网格对照（形状还在时还剩多少）；五子棋 / 反五子棋反过来检验它。
 - **MLP / 1DCNN** 是消融，不是认真选手。
 
-热路径在 C++（`gkt_native`：规则、MCTS、自对弈）；Python 只做调度与训练。训练自对弈的 value 一律是 mix：\(\lambda z+(1-\lambda)Q\)（`--q-lambda` 默认 0.5）。Windows 入口钉死 **Python 3.14**（非 free-threading）。
+热路径在 C++（`gkt_native`：规则、MCTS、自对弈）；Python 只做调度与训练。搜索用的 **value_rto** 是 mix \(\lambda z+(1-\lambda)Q\)（`--q-lambda` 默认 0.5）；监督用的 **value_abs** 是子数差。二者有很低的一致性项（`--value-cons-weight` 默认 0.01）。Windows 入口钉死 **Python 3.14**（非 free-threading）。
 
 ---
 
@@ -24,9 +24,14 @@
 | `starter_gomoku/` `starter_anti_gomoku/` | 五子棋 / 反五子棋，不走 KataGo 蒸馏 |
 | `katago/` | 本机 KataGo，给蒸馏产教师标签 |
 | `distill_data/` | 蒸馏 JSONL |
-| `cur_mod_*` | 正式跨图输出；`cur_mod_gnn/experiment/M0.bat` 是从 0 的 7×7 sanity gate |
+| `cur_mod_*` | 正式跨图输出 |
+| `dist_run/` | 分布式 basedir（`start_dist_main.bat` 默认） |
 | `models/` | Web UI / Elo 用的已部署网 |
+| `start_train.bat` | 本机跨图训练（`starter/` 调用） |
 | `start_ui.bat` | 打开对弈界面 |
+| `start_dist_main.bat` | 分布式教练机：init + shuffle / train / serve |
+| `start_dist_cont.bat` | 分布式客户机：`contribute` |
+| `eol.py` | `.bat` 换行：写完后 `python eol.py`（LF→CRLF）；`--to lf` 相反 |
 
 ---
 
@@ -38,7 +43,7 @@
 2. 基础培养2：`base/cultivate2_*.bat` → `base/cultivate2/<arch>/`（只图 0，20 轮停）
 3. 正式跨图：`starter/train_*.bat` → `cur_mod_*`（全图、无限轮、Arena 开）
 
-环境、旗标、检查点见 [`ref/training_method.md`](ref/training_method.md)。对弈：`start_ui.bat`（或 `cd scr` 后 `python web_ui/server.py`）。
+环境、旗标、检查点见 [`ref/training_method.md`](ref/training_method.md)。对弈：`start_ui.bat`（或 `cd scr` 后 `python web_ui/server.py`）。多机：教练机 `start_dist_main.bat`，客户机 `start_dist_cont.bat`（见 [`ref/training_method.md`](ref/training_method.md) §8）。
 
 ---
 
@@ -49,7 +54,5 @@
 | [`ref/rules.md`](ref/rules.md) | 图围棋规则：盘、气、提子、禁手、终局、多人 |
 | [`ref/gomoku.md`](ref/gomoku.md) | 五子棋 / 反五子棋规则与实验角色 |
 | [`ref/algorithm.md`](ref/algorithm.md) | 特征、MCTS、多头、四种网络、并行、UI、内置图 |
-| [`ref/training_method.md`](ref/training_method.md) | 蒸馏 → 培养2 → 跨图；损失与 value mix；分布式 |
+| [`ref/training_method.md`](ref/training_method.md) | 蒸馏 → 培养2 → 跨图；双 value 头与 mix；分布式 |
 | [`ref/go_glossary.md`](ref/go_glossary.md) | 围棋术语 ↔ 网络头 |
-
-`REVIEW_catastrophic_forgetting.md` 是 2026-09-15 的审查快照，不是现行配置。

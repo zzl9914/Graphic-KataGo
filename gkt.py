@@ -6,8 +6,7 @@ Docs: ``ref/rules.md``, ``ref/gomoku.md``, ``ref/algorithm.md``,
 ``ref/training_method.md``.
 
 These helpers (sample packing, replay buffer, aux targets, eval matches) are
-shared by distillation, cultivate2, official cross-graph training, and the
-from-zero M0 gate.
+shared by distillation, cultivate2, and official cross-graph training.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 import numpy as np
 
@@ -37,12 +37,52 @@ W_FUTURE = 0.25
 N_EXTRA_FEATURES = 6  # lib1, lib2, lib3+, log1p(group), last-move, just-captured
 SQUASH_JAC_FLOOR = 0.2  # min tanh/softplus Jacobian in the backward pass
 REPLAY_ROUNDS = 10  # default --replay-rounds; 1 = do not reload unused.npz
-BUFFER_DROP_FROM_ROUND = 11  # default: start dropping oldest unused this round
+BUFFER_DROP_FROM_ROUND = 5  # Go default: start dropping oldest unused this round
+VALUE_ABS_WEIGHT_DEFAULT = 0.08  # SGD on stone-lead MSE; ~30/361
+VALUE_RTO_WEIGHT_DEFAULT = 5.0   # SGD on search-scale lead/n
+VALUE_CONS_WEIGHT_DEFAULT = 0.01  # (abs - n*rto)^2; k-row uses (abs - rto)^2
 BUFFER_DROP_RATIO = 1.0  # FIXED (not a knob): auto drop = round(unused_net * this)
 BUFFER_SNAPSHOT_ROUNDS = 5  # default --buffer-snapshot-rounds; 0 = off
 MODEL_SNAPSHOT_ROUNDS = 5  # default --model-snapshot-rounds; 0 = keep all round*.pt/.npz
 DIRICHLET_FRAC = 0.0  # eval/UI/Arena: pure visit-argmax, no root noise (greedy strength test).
 # Self-play exploration noise lives in C++ (MCTSConfig.dirichlet_alpha), separate.
+
+
+def cli_flag_set(*names: str) -> bool:
+    """True if any of these flags appear on ``sys.argv`` (bare or ``--flag=``)."""
+    flags = {"--" + str(n).lstrip("-").replace("_", "-") for n in names}
+    return any(a.split("=", 1)[0] in flags for a in sys.argv[1:])
+
+
+def apply_krow_train_defaults(args):
+    """Fill Gomoku / Anti-Gomoku knobs only when the user did not pass them.
+
+    Graph-Go argparse defaults match ``starter/train_*.bat``. k-in-a-row
+    bats only pass ``--rules``; this keeps those bats short without
+    changing Go defaults.
+    """
+    if not is_k_in_row_rules(getattr(args, "rules", "go")):
+        return []
+    specs = (
+        ("sim", 800, ("sim",)),
+        ("gpw", 16, ("gpw",)),
+        ("steps", 4, ("steps",)),
+        ("lr", 1e-3, ("lr",)),
+        ("value_weight", 1.0, ("value-weight",)),
+        ("value_rto_weight", 1.0, ("value-rto-weight",)),
+        ("own_weight", 1.0, ("own-weight",)),
+        ("value_cons_weight", VALUE_CONS_WEIGHT_DEFAULT, ("value-cons-weight",)),
+        ("temperature", 1.0, ("temperature",)),
+        ("arena", False, ("arena", "no-arena")),
+        ("buffer_drop_from_round", "11", ("buffer-drop-from-round",)),
+    )
+    applied = []
+    for attr, value, flags in specs:
+        if cli_flag_set(*flags):
+            continue
+        setattr(args, attr, value)
+        applied.append(attr)
+    return applied
 
 
 def feature_dim(num_players: int) -> int:
@@ -69,10 +109,40 @@ def occupancy_with_empty(X: np.ndarray, num_players: int) -> np.ndarray:
 
 
 def score_lead(my: float, total: float, n: int, num_players: int) -> float:
-    """Komi-free lead in [-1, 1]: (k * my - S) / ((k-1) * n)."""
+    """Komi-free lead in [-1, 1]: (k * my - S) / ((k-1) * n). Search / Arena."""
     k = max(int(num_players), 2)
     denom = (k - 1) * max(int(n), 1)
     return float(np.clip((k * float(my) - float(total)) / denom, -1.0, 1.0))
+
+
+def score_lead_abs(my: float, total: float, num_players: int) -> float:
+    """Komi-free stone lead: (k * my - S) / (k-1). 2P is my - opp. No /n."""
+    k = max(int(num_players), 2)
+    return float((k * float(my) - float(total)) / (k - 1))
+
+
+def sample_value_abs(sample) -> float:
+    return float(sample[4])
+
+
+def sample_value_rto(sample) -> float:
+    if len(sample) < 13:
+        raise ValueError("self-play sample must be a 13-tuple with value_rto")
+    return float(sample[12])
+
+
+def value_cons_scale(n_verts, mul_n: bool) -> float:
+    """Go: identity is abs ≈ n·rto. k-in-a-row: both heads already in [-1, 1]."""
+    return float(n_verts) if mul_n else 1.0
+
+
+def set_value_loss_attrs(net, *, value_weight, value_rto_weight, own_weight,
+                         value_cons_weight, rules: str = "go"):
+    net.value_weight = float(value_weight)
+    net.value_rto_weight = float(value_rto_weight)
+    net.own_weight = float(own_weight)
+    net.value_cons_weight = float(value_cons_weight)
+    net.value_cons_mul_n = not is_k_in_row_rules(rules)
 
 
 def curriculum_max_moves(n: int, rnd: int, min_moves: int = 40,
@@ -93,6 +163,41 @@ def curriculum_max_moves(n: int, rnd: int, min_moves: int = 40,
         return max_cap   # curriculum disabled: full length from round 1
     step = (max_cap - min_moves) / max(int(curriculum_rounds) - 1, 1)
     return min(min_moves + int(round(step * (int(rnd) - 1))), max_cap)
+
+
+def shuffle_graph_keys(keys, rnd) -> List[str]:
+    """Deterministic graph order for training round ``rnd``.
+
+    Uses a *private* ``random.Random(rnd)``, never the process-global
+    ``random`` module (CPU SGD samples from that). Same key list + same
+    ``rnd`` ⇒ same permutation, so resume can skip finished graphs without
+    repeating or dropping any. This is the one training RNG that must be
+    reproducible; it is for visit-uniformity across graphs, not for
+    replicating a run.
+    """
+    order = [str(k) for k in keys]
+    random.Random(int(rnd)).shuffle(order)
+    return order
+
+
+def resume_graph_cursor(keys, last_round, last_key, arena: bool):
+    """``(start_rnd, start_idx)`` after finishing ``last_key`` in ``last_round``.
+
+    ``start_idx == len(shuffled)`` means the round's graphs are done: with
+    Arena on, re-enter the gate (empty graph list); otherwise start the
+    next round. If ``last_key`` is not in this run's set, skip to the next
+    round (caller should log).
+    """
+    rk = shuffle_graph_keys(keys, last_round)
+    lk = str(last_key)
+    if lk not in rk:
+        return int(last_round) + 1, 0, rk, False
+    idx = rk.index(lk)
+    if idx < len(rk) - 1:
+        return int(last_round), idx + 1, rk, True
+    if arena:
+        return int(last_round), len(rk), rk, True
+    return int(last_round) + 1, 0, rk, True
 
 
 def forbid_pass_after(n: int, max_moves: int) -> int:
@@ -202,7 +307,7 @@ def make_move_heartbeat(path: Optional[str], prefix: str):
 
 
 def aux_from_sample(sample) -> Dict:
-    """KataGo-style aux fields from a 12-tuple self-play sample."""
+    """KataGo-style aux fields from a 13-tuple self-play sample."""
     return {
         "q": sample[6],
         "opp": sample[7],
@@ -210,11 +315,12 @@ def aux_from_sample(sample) -> Dict:
         "future": sample[9],
         "lead": sample[10],
         "weight": float(sample[11]),
+        "value_rto": sample_value_rto(sample),
     }
 
 
 def stack_aux(batch) -> Dict:
-    """Stack aux targets from a list of 12-tuple samples."""
+    """Stack aux targets from a list of 13-tuple samples."""
     return {
         "q": np.array([s[6] for s in batch], dtype=np.float32),
         "opp": np.stack([s[7] for s in batch]),
@@ -222,12 +328,13 @@ def stack_aux(batch) -> Dict:
         "future": np.stack([s[9] for s in batch]),
         "lead": np.array([s[10] for s in batch], dtype=np.float32),
         "weight": np.array([s[11] for s in batch], dtype=np.float32),
+        "value_rto": np.array([sample_value_rto(s) for s in batch], dtype=np.float32),
     }
 
 
 def pack_samples(samples: List[Tuple], graph_key: str,
                  extra: Optional[Dict] = None) -> bytes:
-    """Compress 12-tuple self-play rows to an npz blob (one graph)."""
+    """Compress 13-tuple self-play rows to an npz blob (one graph)."""
     if not samples:
         raise ValueError("no samples to pack")
     payload = {
@@ -243,6 +350,8 @@ def pack_samples(samples: List[Tuple], graph_key: str,
         "future": np.stack([s[9] for s in samples]),
         "lead": np.array([s[10] for s in samples], dtype=np.float32),
         "weight": np.array([s[11] for s in samples], dtype=np.float32),
+        "value_rto": np.array([sample_value_rto(s) for s in samples],
+                             dtype=np.float32),
         "_graph": np.asarray(graph_key),
     }
     if extra:
@@ -278,6 +387,9 @@ def unpack_samples(data) -> Tuple[str, List[Tuple]]:
         future = z["future"]
         lead = z["lead"]
         weight = z["weight"]
+        if "value_rto" not in z:
+            raise ValueError("npz missing value_rto; 12-tuple buffers are not supported")
+        value_rto = z["value_rto"]
         n = X.shape[0]
         samples = []
         for i in range(n):
@@ -286,6 +398,7 @@ def unpack_samples(data) -> Tuple[str, List[Tuple]]:
                 float(value[i]), own[i], float(q[i]),
                 opp[i], float(opp_w[i]), future[i],
                 float(lead[i]), float(weight[i]),
+                float(value_rto[i]),
             ))
         return graph, samples
     finally:
@@ -440,6 +553,95 @@ def prune_buffer_snapshots(outdir: str, key: str, keep: int) -> int:
     return removed
 
 
+def load_buffer_snapshot(outdir: str, key: str, rnd: int) -> List[Tuple]:
+    """Read one per-round unused-buffer snapshot, or ``[]`` if missing."""
+    path = buffer_snapshot_path(outdir, key, rnd)
+    if not os.path.isfile(path):
+        return []
+    try:
+        _, rows = unpack_samples(path)
+        return rows
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def restore_unused_from_prior_snapshot(
+        outdir: str, key: str, rnd: int,
+        cap: Optional[int] = None) -> int:
+    """Replace ``unused.npz`` with the latest snapshot strictly before ``rnd``.
+
+    Returns the snapshot round loaded, or 0 if the queue was cleared.
+    """
+    folder = os.path.join(outdir, "replay", _replay_key(key), "snapshots")
+    prior = []
+    if os.path.isdir(folder):
+        for name in os.listdir(folder):
+            m = re.match(r"round(\d+)\.npz$", name)
+            if m and int(m.group(1)) < int(rnd):
+                prior.append(int(m.group(1)))
+    if not prior:
+        save_unused_buffer(outdir, key, [])
+        return 0
+    src_rnd = max(prior)
+    rows = load_buffer_snapshot(outdir, key, src_rnd)
+    save_unused_buffer(outdir, key, rows, cap=cap)
+    return src_rnd
+
+
+def drop_buffer_snapshot(outdir: str, key: str, rnd: int) -> bool:
+    """Delete this round's buffer snapshot (rejected-net samples)."""
+    path = buffer_snapshot_path(outdir, key, rnd)
+    if not os.path.isfile(path):
+        return False
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def quarantine_ckpt(outdir: str, filename: str) -> Optional[str]:
+    """Move ``outdir/filename`` into ``outdir/rejected/`` if it exists."""
+    src = os.path.join(outdir, filename)
+    if not os.path.isfile(src):
+        return None
+    dest_dir = os.path.join(outdir, "rejected")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, filename)
+    if os.path.isfile(dest):
+        stem, ext = os.path.splitext(filename)
+        dest = os.path.join(dest_dir, f"{stem}_{int(time.time())}{ext}")
+    os.replace(src, dest)
+    return dest
+
+
+def quarantine_round_artifacts(outdir: str, rnd: int, ext: str) -> List[str]:
+    """Move this round's ``roundN`` / ``bigN`` checkpoints into ``rejected/``."""
+    ext = "." + str(ext).lstrip(".")
+    moved = []
+    for prefix in ("round", "big"):
+        dest = quarantine_ckpt(outdir, f"{prefix}{int(rnd)}{ext}")
+        if dest:
+            moved.append(dest)
+    return moved
+
+
+def rollback_unused_after_reject(
+        outdir: str, keys, rnd: int,
+        cap: Optional[int] = None) -> Dict[str, int]:
+    """Restore each graph's unused queue from the last accepted snapshot.
+
+    Also drops this round's buffer snapshot so rejected-net samples are not
+    the next rollback point. Values are the snapshot round loaded (0 = cleared).
+    """
+    restored = {}
+    for key in keys:
+        src = restore_unused_from_prior_snapshot(outdir, key, rnd, cap=cap)
+        drop_buffer_snapshot(outdir, key, rnd)
+        restored[str(key)] = src
+    return restored
+
+
 def _prune_numbered_snapshots(outdir: str, prefix: str, keep: int,
                                ext: str) -> int:
     """Keep the most recent ``keep`` ``<prefix><n>``+``ext`` files in ``outdir``.
@@ -480,6 +682,17 @@ def prune_model_snapshots(outdir: str, keep: int, ext: str = ".pt") -> int:
     are pure history once ``new.*``/``best.*`` hold the live/best weights).
     """
     return _prune_numbered_snapshots(outdir, "round", keep, ext)
+
+
+def snapshot_tail(items, keep: int):
+    """Last ``keep`` items of a sequence already in order.
+
+    ``keep <= 0`` is empty. Do not use ``xs[-0:]``: in Python that is ``xs[0:]``.
+    """
+    k = int(keep)
+    if k <= 0:
+        return []
+    return list(items)[-k:]
 
 
 def prune_big_snapshots(outdir: str, keep: int, ext: str = ".pt") -> int:
@@ -657,7 +870,7 @@ class GktSelfPlay:
             self.net = SearchAugNet(net, graph, fresh_each_batch=True)
 
     def play_one_game(self, heartbeat=None):
-        """Self-play samples: 12-tuple from C++ `play_one_game`."""
+        """Self-play samples: 13-tuple from C++ `play_one_game`."""
         from gkt_cpp import play_one_game as cpp_play
         return cpp_play(
             self.graph, self.net, n_simulations=self.n_sim,

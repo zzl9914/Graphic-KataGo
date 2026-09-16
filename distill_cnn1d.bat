@@ -13,8 +13,8 @@ REM  Usage:
 REM    base\distill_cnn1d.bat                    (distill_data/m2_19x19.jsonl)
 REM    base\distill_cnn1d.bat <path-to.jsonl>    (explicit data, root-relative)
 REM
-REM  Re-run the same bat to resume: --resume loads the highest round*.npz
-REM  in base/cnn1d/ and continues at epoch N+1. No checkpoint = epoch 1.
+REM  Mid-run: --resume from the highest round*.npz. After new.npz, epoch
+REM  snapshots are deleted; re-run keeps new.npz. No new and no rounds = epoch 1.
 REM  --aug-from-epoch 4: epochs 1-3 identity numbering, then S_n.
 REM =====================================================================
 
@@ -42,7 +42,7 @@ if "%DATA%"=="" set "DATA=distill_data/m2_19x19.jsonl"
 if not exist "%~dp0..\%DATA%" (
   echo [ERROR] distill data not found: %~dp0..\%DATA%
   echo.
-  echo  Generate the JSONL via scr\gen_katago_data.py ^(drives katago\katago.exe^),
+  echo  Generate the JSONL:  distill_data\gen_m2_19x19.bat
   echo  then re-run: base\distill_cnn1d.bat ^<data.jsonl^>
   echo.
   pause
@@ -52,14 +52,16 @@ if not exist "%~dp0..\%DATA%" (
 echo Data: %~dp0..\%DATA%
 echo Interpreter: %PY%
 
-if exist "%~dp0cnn1d\round*.npz" (
+if exist "%~dp0cnn1d\new.npz" (
+  echo Product already at base\cnn1d\new.npz
+) else if exist "%~dp0cnn1d\round1.npz" (
   echo Resume: latest round*.npz under base\cnn1d
 ) else (
-  echo No round*.npz under base\cnn1d - starting a new distillation.
+  echo No checkpoint under base\cnn1d - starting a new distillation.
 )
 
 cd /d "%~dp0..\scr"
-"%PY%" distill.py --net 1dcnn --data "../%DATA%" --graph-key 0 --outdir ../base/cnn1d --hidden 512 --kernel-size 3 --conv-layers 20 --epochs 10 --batch-size 64 --lr 1e-4 --value-weight 30 --own-weight 5 --aug-from-epoch 4 --resume
+"%PY%" distill.py --net 1dcnn --data "../%DATA%"
 
 echo.
 echo Distillation finished. The base 1DCNN is at base\cnn1d\new.npz.

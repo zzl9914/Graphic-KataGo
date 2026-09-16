@@ -211,14 +211,23 @@ std::vector<Sample> play_one_game(std::shared_ptr<const Graph> graph,
     int n_s = static_cast<int>(samples.size());
     for (int i = 0; i < n_s; i++) {
         auto [lead, own] = score_lead_and_ownership(fr, samples[i].me, n, num_players);
-        // mix: q_lambda weights Monte-Carlo z (lead); 1-q_lambda weights root Q
-        float target = cfg.q_lambda * lead + (1.f - cfg.q_lambda) * samples[i].q;
+        float total = 0.f;
+        for (int p = 1; p <= num_players; p++) total += fr.scores[p];
+        float my = (samples[i].me < static_cast<int>(fr.scores.size()))
+            ? fr.scores[samples[i].me] : 0.f;
+        float lead_abs = fr.binary ? lead : score_lead_abs(my, total, num_players);
+        // rto (search): mix z/n with root Q. abs (supervision): MC stones only
+        // on Graph-Go so the two heads can disagree; k-in-a-row shares the mix
+        // (already in [-1, 1], no board-size scale).
+        float rto_t = cfg.q_lambda * lead + (1.f - cfg.q_lambda) * samples[i].q;
+        float abs_t = fr.binary ? rto_t : lead_abs;
         Sample s;
         s.features = samples[i].X;
         s.legal_mask = samples[i].mask;
         s.policy = samples[i].pol;
         s.me = samples[i].me;
-        s.value = target;
+        s.value = abs_t;
+        s.value_rto = rto_t;
         s.ownership = std::move(own);
         s.q = samples[i].q;
         if (i + 1 < n_s) {

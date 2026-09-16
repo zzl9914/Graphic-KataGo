@@ -25,12 +25,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from graphs import DiGraph, is_k_in_row_rules  # noqa: E402
 from gkt import (  # noqa: E402
-    GktSelfPlay, stack_aux,
+    GktSelfPlay, stack_aux, set_value_loss_attrs,
     SCORE_BINS,
     W_OPP_POLICY, W_SOFT_POLICY, W_BELIEF_PDF, W_BELIEF_CDF,
     W_STDEV, W_FUTURE, lead_belief, soft_policy_target,
     progress_append, make_move_heartbeat, worker_progress_path,
     feature_dim, require_feature_dim, SQUASH_JAC_FLOOR,
+    VALUE_CONS_WEIGHT_DEFAULT, value_cons_scale,
 )
 from grid_sym import augment_vertex_batch, augment_graph_batch  # noqa: E402
 
@@ -107,19 +108,17 @@ def _zero_linear(layer: nn.Linear) -> None:
 def _zero_squash_heads(net, value_heads: bool = True) -> None:
     """Zero the squash heads' output layers.
 
-    ``value_fc2`` / ``own_head`` are zeroed so value & ownership start at a
-    constant 0 — correct for from-zero self-play, where an early random value
-    would mislead MCTS. For supervised distillation they must NOT be zeroed:
-    the value/own gradient is already ~1e-2 of the policy gradient, and a zero
-    init welds those heads shut (no gradient reaches the trunk until the last
-    layer grows a non-zero weight). Pass ``value_heads=False`` there.
+    ``value_fc2`` / ``value_abs_head`` / ``own_head`` are zeroed so the two
+    value heads and ownership start at a constant 0 — a random value head
+    would mislead MCTS at the start of training. For supervised distillation
+    they must NOT be zeroed: pass ``value_heads=False`` there.
 
     ``fut_head`` / ``stdev_head`` are always zeroed (no trustworthy target in
     either regime).
     """
     names = ["fut_head", "stdev_head"]
     if value_heads:
-        names = ["value_fc2", "own_head"] + names
+        names = ["value_fc2", "value_abs_head", "own_head"] + names
     for name in names:
         _zero_linear(getattr(net, name))
 
@@ -155,8 +154,12 @@ def _squash_softplus(pre):
 
 
 def _pool_heads(net, h, hv):
+    v_rto = _squash_tanh(net.value_fc2(hv))
+    v_abs = net.value_abs_head(h).squeeze(-1).sum(dim=1, keepdim=True)
     return {
-        "value": _squash_tanh(net.value_fc2(hv)),
+        "value": v_rto,
+        "value_rto": v_rto,
+        "value_abs": v_abs,
         "own": _squash_tanh(net.own_head(h).squeeze(-1)),
         "future": _squash_tanh(net.fut_head(h).squeeze(-1)),
         "belief": _clamp_logits(net.belief_head(hv)),
@@ -187,6 +190,8 @@ def _permute_adj_batch(adj, perms):
 
 def _gpu_train_on_batch(net, X, mask, policy, value, ownership, aux):
     aux = dict(aux)
+    if "value_rto" not in aux:
+        raise ValueError("train requires aux['value_rto']")
     nt = getattr(net, "net_type", "")
     adj_in = adj_out = None
     if nt == "2dcnn":
@@ -219,8 +224,15 @@ def _gpu_train_on_batch(net, X, mask, policy, value, ownership, aux):
         out = net.forward(X_t)
     w = _sample_w(aux, X_t.shape[0], net.device)
     policy_loss = (w * _masked_ce(out["policy"], p_t, m_t)).mean()
-    value_loss = (w * (out["value"].squeeze(-1) - v_t).pow(2)).mean()
+    rto_t = torch.from_numpy(np.asarray(aux["value_rto"], dtype=np.float32)).float().to(
+        net.device).reshape(-1)
+    abs_loss = (w * (out["value_abs"].squeeze(-1) - v_t).pow(2)).mean()
+    rto_loss = (w * (out["value"].squeeze(-1) - rto_t).pow(2)).mean()
     own_loss = (w * (out["own"] - o_t).pow(2).mean(dim=-1)).mean()
+    n_verts = int(X_t.shape[1])
+    scale = value_cons_scale(n_verts, getattr(net, "value_cons_mul_n", True))
+    cons_loss = (w * (out["value_abs"].squeeze(-1)
+                      - scale * out["value"].squeeze(-1)).pow(2)).mean()
 
     opp_t = torch.from_numpy(np.asarray(aux["opp"], dtype=np.float32)).float().to(net.device)
     opp_w = torch.from_numpy(np.asarray(aux["opp_w"], dtype=np.float32)).float().to(net.device)
@@ -248,11 +260,14 @@ def _gpu_train_on_batch(net, X, mask, policy, value, ownership, aux):
     aux_loss = aux_loss + W_FUTURE * (w * (out["future"] - fut_t).pow(2).mean(dim=-1)).mean()
 
     vw = float(getattr(net, "value_weight", 1.0))
+    vr = float(getattr(net, "value_rto_weight", 1.0))
     ow = float(getattr(net, "own_weight", 1.0))
-    loss = policy_loss + vw * value_loss + ow * own_loss + aux_loss
+    wc = float(getattr(net, "value_cons_weight", 0.0))
+    aux_loss = aux_loss + wc * cons_loss
+    loss = policy_loss + vw * abs_loss + vr * rto_loss + ow * own_loss + aux_loss
     net.optimizer.zero_grad(set_to_none=True)
     if not torch.isfinite(loss):
-        return _loss_floats(policy_loss, value_loss, own_loss, aux_loss, loss)
+        return _loss_floats(policy_loss, abs_loss, own_loss, aux_loss, loss)
     loss.backward()
     gn = nn.utils.clip_grad_norm_(net.parameters(), 1.0)
     if (not math.isfinite(float(gn))) or (not _grads_finite(net)):
@@ -262,7 +277,7 @@ def _gpu_train_on_batch(net, X, mask, policy, value, ownership, aux):
     if not gpu_net_finite(net):
         net.optimizer.zero_grad(set_to_none=True)
         return (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
-    return _loss_floats(policy_loss, value_loss, own_loss, aux_loss, loss)
+    return _loss_floats(policy_loss, abs_loss, own_loss, aux_loss, loss)
 
 
 def _set_weights_strict(net, weights: Dict[str, np.ndarray]):
@@ -417,7 +432,8 @@ class GnnPolicyValueNet(nn.Module, _GpuNetIO):
     Encoder adds a derived empty channel. Trunk: in/out sum-aggregation MLP
     residuals with per-block gpool, plus one global self-attention block
     before `attn_layer`. Heads: per-vertex policy (pass is the same Linear
-    on mean(h)), attention-pooled value, ownership / future / belief / stdev.
+    on mean(h)), attention-pooled value_rto, per-vertex-sum value_abs,
+    ownership / future / belief / stdev.
 
     Weights depend only on F and H. Adjacency is 0/1 data from `set_graph()`.
     Graph-Go pass is index n (k-in-a-row masks it).
@@ -452,6 +468,7 @@ class GnnPolicyValueNet(nn.Module, _GpuNetIO):
         self.value_attn = nn.Linear(hidden_dim, 1)    # -> (B, n) per-vertex attention logits
         self.value_fc1 = nn.Linear(hidden_dim, 256)
         self.value_fc2 = nn.Linear(256, 1)
+        self.value_abs_head = nn.Linear(hidden_dim, 1)
         self.own_head = nn.Linear(hidden_dim, 1)      # -> (B, n) per-vertex ownership
         self.opp_head = nn.Linear(hidden_dim, 1)
         self.opp_pass = nn.Linear(hidden_dim, 1)      # in state_dict; not in forward
@@ -546,15 +563,17 @@ class _CNNResBlock(nn.Module):
 class Cnn2dPolicyValueNet(nn.Module, _GpuNetIO):
     """2D-convolutional policy-value net for grid-shaped boards.
 
-    GPU 2DCNN: a 1x1 stem, then `n_blocks` 2D residual blocks (no global
-    self-attention — that layer is GNN-only),     a 1x1 policy head (pass is the same conv on the spatial mean;
-    Graph-Go; k-in-a-row masks index n), and an
-    attention-pooled value head. Same interface as `GnnPolicyValueNet`.
+    1×1 stem, then ``n_blocks`` residual 2D conv blocks (no global
+    self-attention; that layer is GNN-only). Policy is a 1×1 conv over the
+    grid; the pass logit is the same conv applied to the spatial mean.
+    k-in-a-row graphs mask index ``n`` (pass). Search value is attention-pooled
+    into a shared MLP (rto); abs is a per-vertex Linear summed over the grid.
+    Same I/O as ``GnnPolicyValueNet``.
 
     Unlike the GNN (any graph), the 2DCNN only applies to graphs with
-    ``.grid`` metadata: it reshapes n vertices into an R×C image. The 1x1
-    policy head and attention-pooled value head keep it transferable across
-    board sizes; `set_graph` recovers (R, C) and toroidality from `graph.grid`.
+    ``.grid`` metadata: it reshapes n vertices into an R×C image. The 1×1
+    policy head and both value heads keep it transferable across
+    board sizes; ``set_graph`` recovers (R, C) and toroidality from ``graph.grid``.
     """
 
     def __init__(self, n_features: Optional[int] = None, hidden_dim: int = 512,
@@ -585,6 +604,7 @@ class Cnn2dPolicyValueNet(nn.Module, _GpuNetIO):
         self.value_attn = nn.Linear(hidden_dim, 1)       # per-vertex attn logits
         self.value_fc1 = nn.Linear(hidden_dim, 256)
         self.value_fc2 = nn.Linear(256, 1)
+        self.value_abs_head = nn.Linear(hidden_dim, 1)
         self.own_head = nn.Linear(hidden_dim, 1)         # per-vertex ownership
         self.opp_conv = nn.Conv2d(hidden_dim, 1, 1)
         self.opp_pass = nn.Linear(hidden_dim, 1)         # in state_dict; not in forward
@@ -726,13 +746,17 @@ def make_net(net_type: str, n_features: Optional[int], hidden_dim: int, n_blocks
              graph: Optional[DiGraph] = None, device: str = "cpu",
              lr: float = 1e-3, attn_layer: int = 8, n_heads: int = 4,
              num_players: int = 2, zero_value_heads: bool = True,
-             value_weight: float = 1.0, own_weight: float = 1.0):
+             value_weight: float = 1.0, own_weight: float = 1.0,
+             value_rto_weight: float = 1.0,
+             value_cons_weight: float = VALUE_CONS_WEIGHT_DEFAULT,
+             rules: str = "go"):
     """Build a GPU net by type ('gnn' | '2dcnn'). F = feature_dim(num_players).
 
     ``zero_value_heads=False`` leaves value/own heads at their random init —
     required for supervised distillation, where the zero init collapses them.
-    ``value_weight`` / ``own_weight`` scale the SGD terms (reported losses stay
-    unweighted). Go self-play bats pass the same 30 / 5 as distill stage 1.
+    ``value_weight`` scales abs (stone) MSE; ``value_rto_weight`` scales the
+    search-head MSE; ``value_cons_weight`` scales ``(abs - n*rto)^2``
+    (k-in-a-row: ``(abs - rto)^2``; reported vloss is abs, unweighted).
     """
     net_type = gpu_net_type(net_type)
     np_ = _player_count(num_players)
@@ -750,8 +774,9 @@ def make_net(net_type: str, n_features: Optional[int], hidden_dim: int, n_blocks
                                 n_blocks=n_blocks, graph=graph, device=device,
                                 lr=lr, attn_layer=attn_layer, n_heads=n_heads,
                                 num_players=np_, zero_value_heads=zero_value_heads)
-    net.value_weight = float(value_weight)
-    net.own_weight = float(own_weight)
+    set_value_loss_attrs(
+        net, value_weight=value_weight, value_rto_weight=value_rto_weight,
+        own_weight=own_weight, value_cons_weight=value_cons_weight, rules=rules)
     return net
 
 
@@ -1011,7 +1036,7 @@ def _selfplay_worker(graph: DiGraph, weights: Dict[str, np.ndarray],
                      win_length: int = 5) -> List[Tuple]:
     """Run `n_games` self-play games on a copy of the net. Returns samples.
 
-    Each sample is the 12-tuple from `GktSelfPlay.play_one_game`.
+    Each sample is the 13-tuple from `GktSelfPlay.play_one_game`.
 
     `device` selects where the network forward runs. MCTS select/expand/
     backprop run in C++ (`gkt_native`); leaf evaluation is `predict_batch`
@@ -1088,6 +1113,8 @@ class GktTrainer:
                  win_length: int = 5,
                  value_weight: float = 1.0,
                  own_weight: float = 1.0,
+                 value_rto_weight: float = 1.0,
+                 value_cons_weight: float = VALUE_CONS_WEIGHT_DEFAULT,
                  freeze_policy: bool = False):
         self.graph = graph
         self.num_players = int(num_players)
@@ -1122,7 +1149,9 @@ class GktTrainer:
                             n_blocks=n_blocks, graph=graph,
                             attn_layer=attn_layer, n_heads=n_heads,
                             device=device, lr=lr, num_players=self.num_players,
-                            value_weight=value_weight, own_weight=own_weight)
+                            value_weight=value_weight, own_weight=own_weight,
+                            value_rto_weight=value_rto_weight,
+                            value_cons_weight=value_cons_weight, rules=rules)
         self.device = device
         self.freeze_policy = bool(freeze_policy)
         if self.freeze_policy:
@@ -1150,6 +1179,8 @@ class GktTrainer:
                  f"sim={self.n_simulations}, device={self.device}, "
                  f"batch={self.batch_size} steps={self.steps_per_cycle} "
                  f"value_weight={getattr(self.net, 'value_weight', 1.0):g} "
+                 f"value_rto_weight={getattr(self.net, 'value_rto_weight', 1.0):g} "
+                 f"value_cons_weight={getattr(self.net, 'value_cons_weight', 0.0):g} "
                  f"own_weight={getattr(self.net, 'own_weight', 1.0):g}"
                  f"{' policy=FROZEN' if self.freeze_policy else ''}")
 
@@ -1194,11 +1225,12 @@ class GktTrainer:
                 cycle_value_losses = []
                 cycle_own_losses = []
                 cycle_aux_losses = []
+                sgd_rng = random.Random()
                 if len(buffer) >= self.batch_size:
                     for _ in range(self.steps_per_cycle):
                         if len(buffer) < self.batch_size:
                             break
-                        idx = random.sample(range(len(buffer)), self.batch_size)
+                        idx = sgd_rng.sample(range(len(buffer)), self.batch_size)
                         batch = [buffer[i] for i in idx]
                         X = np.stack([s[0] for s in batch])
                         mask = np.stack([s[1] for s in batch])

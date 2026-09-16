@@ -10,23 +10,19 @@ the same weights apply to any graph regardless of vertex count — this is the
 transfer/migration path (see ``ref/algorithm.md``, ``ref/training_method.md``).
 
 This trainer is the self-play loop for cultivate2 and official cross-graph
-training (``--resume`` a distilled checkpoint), and also for the from-zero M0
-gate. Do not expect from-zero alone to escape uniform random on a single small
-GPU. Stage flags: ``ref/training_method.md``.
+training (``--resume`` a distilled checkpoint). Stage flags:
+``ref/training_method.md``. From-scratch self-play without distillation is
+a plan, not a current run: ``ref/training_method.md`` §6.
 
 Usage (official Go, matches ``starter/*.bat``):
-  python gkt_train_gpu.py --sim 256 --workers 1 --gpw 32 --steps 16 \
-      --lr 1e-4 --value-weight 30 --own-weight 5 --q-lambda 0.5 \
-      --temperature 0.1 --buffer-drop-from-round 5 --device cuda \
+  python gkt_train_gpu.py --infinite
       [--rules go|gomoku|antigomoku] [--outdir ../cur_mod_gnn]
 
 Usage (cultivate2, matches ``base/cultivate2_*.bat``):
   python gkt_train_gpu.py --graphs 0 --rounds 20 --no-arena \
-      --freeze-policy-until-round 10 --value-weight 30 --own-weight 5 \
-      --q-lambda 0.5 \
-      --sim 256 --workers 1 --gpw 32 --steps 16 --lr 1e-4 --temperature 0.1 \
-      --buffer-drop-from-round 21 --model-snapshot-rounds 25 \
-      --device cuda --resume ../base/gnn/new.pt --outdir ../base/cultivate2/gnn
+      --freeze-policy-until-round 10 --buffer-drop-from-round 21 \
+      --model-snapshot-rounds 25 \
+      --resume ../base/gnn/new.pt --outdir ../base/cultivate2/gnn
 """
 from __future__ import annotations
 import os
@@ -36,7 +32,6 @@ import re
 import time
 import argparse
 import gc
-import random
 import numpy as np
 import torch
 
@@ -49,7 +44,7 @@ from graphs import (builtin_graphs, get_builtin,  # noqa: E402
 from gkt_gpu import (GktTrainer,  # noqa: E402
                        make_net, save_net, load_net, maybe_script_infer,
                        gpu_net_finite)
-from gkt import play_eval_match, score_lead, make_move_heartbeat, write_graph_round_summary, reset_worker_progress, feature_dim, load_unused_buffer, save_unused_buffer, drop_oldest_buffer, curriculum_max_moves, REPLAY_ROUNDS, BUFFER_DROP_FROM_ROUND, BUFFER_SNAPSHOT_ROUNDS, MODEL_SNAPSHOT_ROUNDS, auto_buffer_drop, parse_from_round_map, save_buffer_snapshot, prune_buffer_snapshots, prune_model_snapshots, prune_big_snapshots  # noqa: E402
+from gkt import play_eval_match, score_lead, make_move_heartbeat, write_graph_round_summary, reset_worker_progress, feature_dim, load_unused_buffer, save_unused_buffer, drop_oldest_buffer, curriculum_max_moves, shuffle_graph_keys, resume_graph_cursor, apply_krow_train_defaults, REPLAY_ROUNDS, BUFFER_DROP_FROM_ROUND, BUFFER_SNAPSHOT_ROUNDS, MODEL_SNAPSHOT_ROUNDS, auto_buffer_drop, parse_from_round_map, save_buffer_snapshot, prune_buffer_snapshots, prune_model_snapshots, prune_big_snapshots, quarantine_round_artifacts, rollback_unused_after_reject, VALUE_ABS_WEIGHT_DEFAULT, VALUE_RTO_WEIGHT_DEFAULT, VALUE_CONS_WEIGHT_DEFAULT, snapshot_tail  # noqa: E402
 
 EXCLUDE = {"2", "6"}  # oversized: 3721 / 6859 vertices. 2 is a post-train grid generalization board, not a train key.
 GRID_KEYS = ("0", "0.5", "1", "2", "3", "G9", "G15", "G7d", "G9d")  # 2 kept for 2DCNN inference/UI; EXCLUDE drops it from training
@@ -70,6 +65,9 @@ def arena_match(new_weights, old_weights, graph, n_games, sim,
     komi. A 0/1 win/loss would saturate on high-first-move-advantage graphs
     (e.g. the line graph) — the continuous lead does not.
     """
+    if int(n_games) <= 0:
+        return 0.0, 0
+
     def _make(w):
         net = make_net(net_type, n_features, hidden_dim, n_blocks,
                        attn_layer=attn_layer, n_heads=n_heads,
@@ -120,6 +118,31 @@ def _load_weight_dict(path: str) -> dict:
             for k, v in ckpt["model_state_dict"].items()}
 
 
+def _write_round_model_ckpts(args, W, rnd, log):
+    """Per-round / big snapshots of the *accepted* (or no-Arena) weights."""
+    ckpt = os.path.join(args.outdir, f"round{rnd}.pt")
+    if gpu_net_finite(W):
+        save_net(W, ckpt)
+        log(f"round {rnd} done; model checkpoint {ckpt}")
+    else:
+        log(f"round {rnd}: skip model checkpoint (non-finite weights)")
+    n_del = prune_model_snapshots(args.outdir, args.model_snapshot_rounds, ".pt")
+    if n_del:
+        log(f"round {rnd}: pruned {n_del} old model checkpoint(s) "
+            f"(keep last {args.model_snapshot_rounds})")
+    if args.big_snapshot_interval > 0 and rnd % args.big_snapshot_interval == 0:
+        big = os.path.join(args.outdir, f"big{rnd}.pt")
+        if gpu_net_finite(W):
+            save_net(W, big)
+            log(f"round {rnd}: big snapshot {big}")
+        else:
+            log(f"round {rnd}: skip big snapshot (non-finite weights)")
+        n_bdel = prune_big_snapshots(args.outdir, args.big_snapshot_rounds, ".pt")
+        if n_bdel:
+            log(f"round {rnd}: pruned {n_bdel} old big snapshot(s) "
+                f"(keep last {args.big_snapshot_rounds})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--graphs", default=None,
@@ -131,12 +154,13 @@ def main():
     ap.add_argument("--sim", type=int, default=256,
                     help="nominal MCTS simulations per self-play move; each "
                          "search actually draws log-uniform in [sim/4, 4*sim]")
-    ap.add_argument("--temperature", type=float, default=1.0,
-                    help="self-play move temperature (tau): 1.0 = exploratory "
-                         "(from-zero); 0.1 = exploitative (distilled start)")
+    ap.add_argument("--temperature", type=float, default=0.1,
+                    help="self-play move temperature (tau); k-in-a-row fills 1.0 "
+                         "if not on the CLI")
     ap.add_argument("--workers", type=int, default=1)
-    ap.add_argument("--gpw", type=int, default=16,
-                    help="self-play games per worker per cycle")
+    ap.add_argument("--gpw", type=int, default=32,
+                    help="self-play games per worker per cycle; k-in-a-row "
+                         "fills 16 if not on the CLI")
     ap.add_argument("--rounds", type=int, default=4,
                     help="full passes over all graphs (total = rounds * n_graphs cycles)")
     ap.add_argument("--hidden", type=int, default=512)
@@ -153,22 +177,30 @@ def main():
     ap.add_argument("--attn-heads", type=int, default=4,
                     help="number of heads in the global attention layer")
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--value-weight", type=float, default=1.0,
-                    help="SGD weight on value MSE (reported vloss stays unweighted). "
-                         "Go pipeline (distill / cultivate2 / official) uses 30")
-    ap.add_argument("--own-weight", type=float, default=1.0,
+    ap.add_argument("--value-weight", type=float, default=VALUE_ABS_WEIGHT_DEFAULT,
+                    help="SGD weight on value_abs (stone-lead) MSE; reported "
+                         "vloss is unweighted abs. k-in-a-row fills 1 if not on CLI")
+    ap.add_argument("--value-rto-weight", type=float,
+                    default=VALUE_RTO_WEIGHT_DEFAULT,
+                    help="SGD weight on value_rto (lead/n, search head) MSE. "
+                         "k-in-a-row fills 1 if not on CLI")
+    ap.add_argument("--value-cons-weight", type=float,
+                    default=VALUE_CONS_WEIGHT_DEFAULT,
+                    help="SGD weight on (abs - n*rto)^2 (k-in-a-row: abs - rto). "
+                         "Very low so the heads can still disagree")
+    ap.add_argument("--own-weight", type=float, default=5.0,
                     help="SGD weight on ownership MSE (reported oloss stays unweighted). "
-                         "Go pipeline (distill / cultivate2 / official) uses 5")
+                         "k-in-a-row fills 1 if not on the CLI")
     ap.add_argument("--freeze-policy-until-round", type=int, default=0,
                     help="1-based: freeze the policy readout for rounds 1..N "
                          "(train trunk + value/own/aux). 0 = never freeze")
     ap.add_argument("--batch-size", type=int, default=64,
                     help="training batch size (GNN n×n attention ~64 max on "
                          "6 GB VRAM; 256 OOMs)")
-    ap.add_argument("--steps", type=int, default=4,
+    ap.add_argument("--steps", type=int, default=16,
                     help="SGD steps per graph per cycle (steps * batch-size "
-                         "samples consumed per cycle; raise to consume more of "
-                         "each round's fresh games)")
+                         "samples consumed per cycle); k-in-a-row fills 4 if "
+                         "not on the CLI")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--selfplay-device", default="cuda",
                     help="device for self-play net forward (cuda recommended: "
@@ -250,6 +282,7 @@ def main():
                     help="weight of Monte-Carlo z in the mix value target "
                          "(1 - q_lambda weights the MCTS root Q)")
     args = ap.parse_args()
+    krow_applied = apply_krow_train_defaults(args)
 
     krow = is_k_in_row_rules(args.rules)
     if krow:
@@ -308,6 +341,7 @@ def main():
             return
         log(f"2DCNN: training on grid boards only: {', '.join(keys)}"
             + (f" (skipped {', '.join(dropped)})" if dropped else ""))
+    keys = [str(k) for k in keys]
 
     rounds_str = "infinite" if args.infinite else str(args.rounds)
     log(f"=== cross-graph training: rules={args.rules} {len(keys)} graphs "
@@ -315,6 +349,8 @@ def main():
         f"{W.num_players}P F={W.n_features}, "
         f"device={args.device}, workers={args.workers}, rounds={rounds_str}, "
         f"value=mix q_lambda={args.q_lambda:g} ===")
+    if krow_applied:
+        log(f"{args.rules}: defaulted {', '.join(krow_applied)} (not on CLI)")
     if krow:
         log(f"{args.rules}: game length cap is n (no Graph-Go move curriculum)")
         ignored = [f for f in ("--min-moves", "--max-move-factor",
@@ -348,7 +384,9 @@ def main():
         log(f"buffer drop: from round {args.buffer_drop_from_round}, "
             f"{args.buffer_drop} oldest unused per graph (fixed)")
     log(f"SGD aug: random vertex relabel for all nets; GNN also permutes adj")
-    log(f"head weights: value={args.value_weight:g} own={args.own_weight:g} "
+    log(f"head weights: abs={args.value_weight:g} rto={args.value_rto_weight:g} "
+        f"cons={args.value_cons_weight:g} "
+        f"own={args.own_weight:g} "
         f"(reported pl/vl/ol unweighted)")
     until = max(0, int(args.freeze_policy_until_round))
     if until > 0:
@@ -368,7 +406,8 @@ def main():
     t_start = time.time()
 
     # Per-graph resume: last summary.json row is the next round/graph.
-    # Shuffle uses random.Random(rnd), so that round's order is reproducible.
+    # Graph order is shuffle_graph_keys (private Random(rnd)), so this
+    # round's remaining graphs can be reconstructed. SGD uses a different RNG.
     start_rnd = 1
     start_idx = 0
     if args.resume:
@@ -382,23 +421,20 @@ def main():
                 cycle_no = int(last["cycle"])
                 last_round = int(last["round"])
                 lk = last["key"]
-                rk = list(keys)
-                random.Random(last_round).shuffle(rk)
-                if lk in rk:
-                    idx = rk.index(lk)
-                    if idx < len(rk) - 1:
-                        start_rnd, start_idx = last_round, idx + 1
-                    else:
-                        # The round's last graph is already done. If Arena is
-                        # on, re-enter this round's Arena gate first (an empty
-                        # graph list drops straight into the gate below) instead
-                        # of silently skipping it; otherwise advance a round.
-                        if args.arena:
-                            start_rnd, start_idx = last_round, len(rk)
-                        else:
-                            start_rnd, start_idx = last_round + 1, 0
+                start_rnd, start_idx, rk, found = resume_graph_cursor(
+                    keys, last_round, lk, args.arena)
+                if not found:
+                    log(f"resume: last graph {lk!r} not in this run's set "
+                        f"[{', '.join(keys)}]; starting round {start_rnd}")
+                elif start_idx < len(rk):
+                    log(f"resume: round {start_rnd} after graph {lk}; "
+                        f"next {', '.join(rk[start_idx:])}")
+                elif args.arena and start_rnd == last_round:
+                    log(f"resume: round {last_round} graphs done; "
+                        f"re-entering Arena")
                 else:
-                    start_rnd, start_idx = last_round + 1, 0
+                    log(f"resume: round {last_round} graphs done; "
+                        f"starting round {start_rnd}")
         except (OSError, ValueError, KeyError, IndexError, json.JSONDecodeError):
             try:
                 nums = [int(m.group(1)) for fn in os.listdir(args.outdir)
@@ -430,11 +466,10 @@ def main():
         if until > 0:
             log(f"round {rnd}: policy readout "
                 f"{'FROZEN (train trunk+value/own/aux)' if rnd <= until else 'UNFROZEN'}")
-        # Shuffle graph order each round (seeded by rnd, so resume can rebuild
-        # it). Avoids always training early keys more, and avoids a fixed
-        # update order becoming a spurious signal under shared weights.
-        round_keys = list(keys)
-        random.Random(rnd).shuffle(round_keys)
+        # Shuffle graph order each round (private Random(rnd), so resume can
+        # rebuild it). Avoids always training early keys more, and avoids a
+        # fixed update order becoming a spurious signal under shared weights.
+        round_keys = shuffle_graph_keys(keys, rnd)
         if rnd == start_rnd:
             round_keys = round_keys[start_idx:]   # skip graphs already done this round
         if len(round_keys) > 1:
@@ -471,6 +506,8 @@ def main():
                 progress_file=progress_file,
                 rules=args.rules, win_length=args.win_length,
                 value_weight=args.value_weight, own_weight=args.own_weight,
+                value_rto_weight=args.value_rto_weight,
+                value_cons_weight=args.value_cons_weight,
                 freeze_policy=(until > 0 and rnd <= until))
             # transfer the shared weights into this graph's trainer
             trainer.net.set_weights(W.get_weights())
@@ -538,47 +575,12 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        # Round-end artifacts only fire when this round actually trained at least
-        # one graph. Resuming right after a round finished leaves an empty graph
-        # list; the checkpoint / big / buffer snapshots were already written when
-        # the round first completed, so skip them and drop straight into Arena.
+        # Round-end: buffer snapshots always (rollback point). Model snapshots
+        # wait until Arena accepts — a rejected net must not stay in the panel
+        # or in ``roundN``/``bigN``. ``--no-arena`` writes model snapshots here.
+        # Resuming after the last graph of a round leaves ``round_keys`` empty
+        # and drops into Arena; buffers were already snapshotted the first time.
         if round_keys:
-            # per-round model checkpoint (pruned to the last N rounds below)
-            ckpt = os.path.join(args.outdir, f"round{rnd}.pt")
-            if gpu_net_finite(W):
-                save_net(W, ckpt)
-                log(f"round {rnd} done; model checkpoint {ckpt}")
-            else:
-                log(f"round {rnd}: skip model checkpoint (non-finite weights)")
-            # keep only the most recent N round*.pt so disk does not grow
-            # forever; new.pt / best.pt are never touched by this prune.
-            n_del = prune_model_snapshots(args.outdir, args.model_snapshot_rounds,
-                                          ".pt")
-            if n_del:
-                log(f"round {rnd}: pruned {n_del} old model checkpoint(s) "
-                    f"(keep last {args.model_snapshot_rounds})")
-
-            # Long-horizon big snapshot every --big-snapshot-interval rounds,
-            # independent of the small round*.pt snapshots. These feed the Arena
-            # panel as long-horizon opponents (guards against slow drift).
-            if args.big_snapshot_interval > 0 and rnd % args.big_snapshot_interval == 0:
-                big = os.path.join(args.outdir, f"big{rnd}.pt")
-                if gpu_net_finite(W):
-                    save_net(W, big)
-                    log(f"round {rnd}: big snapshot {big}")
-                else:
-                    log(f"round {rnd}: skip big snapshot (non-finite weights)")
-                n_bdel = prune_big_snapshots(args.outdir, args.big_snapshot_rounds,
-                                             ".pt")
-                if n_bdel:
-                    log(f"round {rnd}: pruned {n_bdel} old big snapshot(s) "
-                        f"(keep last {args.big_snapshot_rounds})")
-
-            # Per-round buffer snapshots: unused.npz only holds the *current*
-            # queue (overwritten each visit, oldest dropped), and round*.pt
-            # stores weights only, so a corrupt/over-dropped buffer is otherwise
-            # unrecoverable. Snapshot every graph's buffer at this round boundary
-            # as a rollback point, and prune to the most recent N rounds.
             if args.buffer_snapshot_rounds > 0:
                 for skey in keys:
                     sbuf = load_unused_buffer(args.outdir, skey,
@@ -588,6 +590,8 @@ def main():
                                            args.buffer_snapshot_rounds)
                 log(f"round {rnd}: buffer snapshots saved "
                     f"(keep last {args.buffer_snapshot_rounds} rounds)")
+            if not args.arena:
+                _write_round_model_ckpts(args, W, rnd, log)
 
         # Arena: pit the new weights against a panel of historical opponents —
         # best-so-far, the previous round's small snapshot, and the last N big
@@ -612,7 +616,7 @@ def main():
                 if m and int(m.group(1)) < rnd:
                     big_items.append((int(m.group(1)), fn))
             big_items.sort(key=lambda t: t[0])
-            for bid, fn in big_items[-args.big_snapshot_rounds:]:
+            for bid, fn in snapshot_tail(big_items, args.big_snapshot_rounds):
                 bp = os.path.join(args.outdir, fn)
                 try:
                     panel.append((f"big{bid}", _load_weight_dict(bp)))
@@ -660,19 +664,33 @@ def main():
                         f"({ng} games, {time.time() - t0:.0f}s)")
             log(f"arena: round {rnd} played {total_games} games in "
                 f"{time.time() - t_arena0:.0f}s")
-            avg_lead = total_lead / max(1, total_games)
-            if avg_lead >= args.arena_lead_threshold:
+            if total_games <= 0:
+                log("arena: skip gate (0 games); not accepting, not rolling back")
+            elif (total_lead / total_games) >= args.arena_lead_threshold:
+                avg_lead = total_lead / total_games
                 best_weights = W.get_weights()
                 save_net(W, os.path.join(args.outdir, "best.pt"))
                 log(f"arena: new accepted (avg lead {avg_lead:+.4f} over "
                     f"{total_games} games vs {len(panel)} opponents on "
                     f"{len(arena_keys)} graphs); best.pt updated")
+                _write_round_model_ckpts(args, W, rnd, log)
             else:
+                avg_lead = total_lead / total_games
                 W.set_weights(best_weights)
                 save_net(W, os.path.join(args.outdir, "new.pt"))
                 log(f"arena: new REJECTED (avg lead {avg_lead:+.4f} over "
                     f"{total_games} games vs {len(panel)} opponents); "
                     f"rolled back to best")
+                for dest in quarantine_round_artifacts(args.outdir, rnd, ".pt"):
+                    log(f"arena: moved rejected snapshot → {dest}")
+                restored = rollback_unused_after_reject(args.outdir, keys, rnd)
+                for skey, src_rnd in restored.items():
+                    if src_rnd:
+                        log(f"arena: graph {skey}: restored unused "
+                            f"from round {src_rnd} snapshot")
+                    else:
+                        log(f"arena: graph {skey}: no prior buffer snapshot, "
+                            f"cleared unused")
 
         if not args.infinite and rnd >= args.rounds:
             break

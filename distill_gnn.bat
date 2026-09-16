@@ -7,17 +7,18 @@ REM  Produces the FIRST strong graph-agnostic GNN by supervised-pretraining
 REM  against KataGo teacher labels (policy / score lead / ownership).
 REM  Output: base/gnn/new.pt. Then run base\cultivate2_gnn.bat.
 REM
-REM  Why distillation (not from-zero): pure self-play stalls because the
+REM  Why distillation: pure self-play stalls because the
 REM  value head collapses to a constant (weak signal; 72h+ with no progress
 REM  on a 6 GB GPU). KataGo labels give a real, discriminative signal from
-REM  step 1. From-zero self-play is kept only as M0 (sanity gate).
+REM  step 1. Random-init self-play is not a current run.
 REM
 REM  Usage:
 REM    base\distill_gnn.bat                    (distill_data/m2_19x19.jsonl)
 REM    base\distill_gnn.bat <path-to.jsonl>    (explicit data, root-relative)
 REM
-REM  Re-run the same bat to resume: distill.py --resume loads the highest
-REM  round*.pt in base/gnn/ and continues at epoch N+1. No checkpoint = epoch 1.
+REM  Mid-run: --resume loads the highest round*.pt and continues at epoch N+1.
+REM  After new.pt is written, epoch snapshots are deleted. Re-run then keeps
+REM  new.pt (does not re-distill). No new and no rounds = epoch 1.
 REM  3 stages x 10 epochs (round1-30): joint P+30V+5O @1e-4 (no freeze),
 REM  then own @25x / value @100x with trunk frozen.
 REM  --aug-from-epoch 4: epochs 1-3 keep original vertex numbering, then S_n.
@@ -53,9 +54,8 @@ if not exist "%~dp0..\%DATA%" (
   echo [ERROR] distill data not found: %~dp0..\%DATA%
   echo.
   echo  1. KataGo binary + b18c384nbt weights are under katago/ ^(already set up^).
-  echo  2. Generate the JSONL:  python scr\gen_katago_data.py ^<see its --help^>
-  echo     This drives katago\katago.exe analysis and writes
-  echo     distill_data\m2_19x19.jsonl via scr\distill_katago.py.
+  echo  2. Generate the JSONL:  distill_data\gen_m2_19x19.bat
+  echo     ^(300 games, visits=350; writes distill_data\m2_19x19.jsonl^)
   echo  3. Re-run: base\distill_gnn.bat ^<data.jsonl^>
   echo.
   pause
@@ -65,14 +65,16 @@ if not exist "%~dp0..\%DATA%" (
 echo Data: %~dp0..\%DATA%
 echo Interpreter: %PY%
 
-if exist "%~dp0gnn\round*.pt" (
+if exist "%~dp0gnn\new.pt" (
+  echo Product already at base\gnn\new.pt
+) else if exist "%~dp0gnn\round1.pt" (
   echo Resume: latest round*.pt under base\gnn
 ) else (
-  echo No round*.pt under base\gnn - starting a new distillation.
+  echo No checkpoint under base\gnn - starting a new distillation.
 )
 
 cd /d "%~dp0..\scr"
-"%PY%" distill.py --net gnn --data "../%DATA%" --graph-key 0 --outdir ../base/gnn --hidden 512 --n-blocks 20 --epochs 10 --batch-size 16 --lr 1e-4 --value-weight 30 --own-weight 5 --aug-from-epoch 4 --device cuda --resume
+"%PY%" distill.py --data "../%DATA%"
 
 echo.
 echo Distillation finished. The base GNN is at base\gnn\new.pt.

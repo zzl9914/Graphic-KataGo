@@ -11,8 +11,8 @@ REM  Usage:
 REM    base\distill_cnn2d.bat                    (distill_data/m2_19x19.jsonl)
 REM    base\distill_cnn2d.bat <path-to.jsonl>    (explicit data, root-relative)
 REM
-REM  Re-run the same bat to resume: --resume loads the highest round*.pt
-REM  in base/cnn2d/ and continues at epoch N+1. No checkpoint = epoch 1.
+REM  Mid-run: --resume from the highest round*.pt. After new.pt, epoch
+REM  snapshots are deleted; re-run keeps new.pt. No new and no rounds = epoch 1.
 REM  --aug-from-epoch 4: epochs 1-3 identity board, then D4/Klein/torus.
 REM
 REM  batch 16 is a hard ceiling on 19x19 (batch 32 OOMs on 6 GB VRAM).
@@ -42,7 +42,7 @@ if "%DATA%"=="" set "DATA=distill_data/m2_19x19.jsonl"
 if not exist "%~dp0..\%DATA%" (
   echo [ERROR] distill data not found: %~dp0..\%DATA%
   echo.
-  echo  Generate the JSONL via scr\gen_katago_data.py ^(drives katago\katago.exe^),
+  echo  Generate the JSONL:  distill_data\gen_m2_19x19.bat
   echo  then re-run: base\distill_cnn2d.bat ^<data.jsonl^>
   echo.
   pause
@@ -52,14 +52,16 @@ if not exist "%~dp0..\%DATA%" (
 echo Data: %~dp0..\%DATA%
 echo Interpreter: %PY%
 
-if exist "%~dp0cnn2d\round*.pt" (
+if exist "%~dp0cnn2d\new.pt" (
+  echo Product already at base\cnn2d\new.pt
+) else if exist "%~dp0cnn2d\round1.pt" (
   echo Resume: latest round*.pt under base\cnn2d
 ) else (
-  echo No round*.pt under base\cnn2d - starting a new distillation.
+  echo No checkpoint under base\cnn2d - starting a new distillation.
 )
 
 cd /d "%~dp0..\scr"
-"%PY%" distill.py --net 2dcnn --data "../%DATA%" --graph-key 0 --outdir ../base/cnn2d --hidden 512 --n-blocks 20 --epochs 10 --batch-size 16 --lr 1e-4 --value-weight 30 --own-weight 5 --aug-from-epoch 4 --device cuda --resume
+"%PY%" distill.py --net 2dcnn --data "../%DATA%"
 
 echo.
 echo Distillation finished. The base 2DCNN is at base\cnn2d\new.pt.

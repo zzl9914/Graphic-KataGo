@@ -45,7 +45,7 @@ if errorlevel 1 (
 )
 
 start "" cmd /c "timeout /t 2 /nobreak >nul & start http://127.0.0.1:8765/"
-"%PY%" web_ui\server.py --port 8765 --device cuda
+"%PY%" web_ui\server.py
 echo.
 echo Server exited.
 pause

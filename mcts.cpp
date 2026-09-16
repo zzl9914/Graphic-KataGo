@@ -46,6 +46,11 @@ float score_lead(float my, float total, int n, int num_players) {
     return x;
 }
 
+float score_lead_abs(float my, float total, int num_players) {
+    int k = std::max(num_players, 2);
+    return (static_cast<float>(k) * my - total) / static_cast<float>(k - 1);
+}
+
 int MCTS::new_node(int parent, int action, float prior) {
     Node nd;
     nd.parent = parent;

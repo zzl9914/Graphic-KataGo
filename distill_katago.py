@@ -23,8 +23,8 @@ Coordinate mapping (verified empirically against KataGo v1.18.0 output):
   No flip is needed (the old code's vertical flip was wrong).
 
   ``scoreLead`` (with ``reportAnalysisWinratesAs = SIDETOMOVE`` in the config)
-  is the mover's lead: positive = side-to-move ahead. This matches gkt's
-  ``score_lead = (my - opp)/n`` directly, so distill.py can consume it as-is.
+  is the mover's lead in points. Distill maps it to abs (stones) and
+  rto (``/n``) separately.
 
 GTP note: KataGo GTP column letters skip 'I' (A..H, J..T); row "1" is the
 bottom row. So a GTP move string maps to a gkt index as
@@ -90,6 +90,7 @@ def parse_analysis(resp: dict, board: list, to_move: int, rows: int, cols: int):
 
     Returns the JSONL dict that ``distill.py`` expects:
         {"to_move", "board", "policy" (n+1), "scoreLead", "ownership" (n)}
+        ``gen_katago_data.py`` also writes ``game_id`` (0-based game index).
     """
     n = rows * cols
     ri = resp.get("rootInfo", resp)

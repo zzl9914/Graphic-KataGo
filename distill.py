@@ -2,10 +2,11 @@
 
 Stage 1 of the Go pipeline (``ref/training_method.md``): pretrain against
 KataGo teacher labels so the value head gets a real signal from step one,
-instead of collapsing under from-zero self-play on a small GPU.
+instead of collapsing under pure self-play on a small GPU.
 
 Output is the distilled checkpoint (「基础培养」) on 19x19. Next: cultivate2,
-then official cross-graph training. From-zero remains only as M0.
+then official cross-graph training. Random-init self-play without a teacher
+is a plan, not a current run (``ref/training_method.md`` §6).
 
 Supported architectures (``--net``):
 
@@ -14,29 +15,31 @@ Supported architectures (``--net``):
     mlp     CPU  MlpPolicyValueNet        (gkt_cpu.py)   -> new.npz
     1dcnn   CPU  Cnn1dPolicyValueNet      (gkt_cpu.py)   -> new.npz
 
-Only THREE heads get distilled targets, because those are the heads KataGo has
-a trustworthy, well-defined signal for:
+Four heads get distilled targets (KataGo has a trustworthy signal):
 
-    policy     KataGo MCTS visit distribution (soft CE)
-    value      KataGo score lead (MSE, mapped to score_lead in [-1, 1])
-    ownership  KataGo ownership (MSE, mapped to mover-relative [-1, 1])
+    policy      KataGo MCTS visit distribution (soft CE)
+    value_abs   KataGo ``scoreLead`` in stones (linear sum head, no tanh)
+    value_rto   ``scoreLead / n`` in [-1, 1] (attention-pool tanh; search)
+    ownership   KataGo ownership (MSE, mapped to mover-relative [-1, 1])
 
-The aux heads (opp / soft / belief / stdev / future) are left at random init;
-they train later during self-play. Distillation runs three stages of
-``--epochs`` each (default 10+10+10). Stage 1 is joint
-``policy + 30*value + 5*own`` with **no freeze**. Stages 2–3 freeze the
-trunk and train own / value alone (Adam lr ×25 / ×100, unweighted MSE).
+The two value heads share a low-weight ``(abs - n*rto)^2`` coupling.
+Aux heads (opp / soft / belief / stdev / future) stay at init until self-play.
+Distillation runs three stages of ``--epochs`` each (default 10+10+10).
+Stage 1 is joint
+``policy + vw*abs + vr*rto + wc*cons + ow*own`` with **no freeze**. Stages 2–3
+freeze the trunk and train own / both value heads (Adam lr ×25 / ×100).
 
 Input (JSONL, one position per line, already in *gkt vertex order* — see
 ``gen_katago_data.py`` / ``distill_katago.py`` for the KataGo -> gkt conversion):
 
     {"to_move": 1, "board": [0/1/2 x n], "policy": [x (n+1)],
-     "scoreLead": 3.14, "ownership": [x n]}
+     "scoreLead": 3.14, "ownership": [x n], "game_id": 0}
 
 Output: a standard gkt checkpoint ``<outdir>/new.pt`` (GPU) or ``<outdir>/new.npz``
-(CPU) that the self-play trainers load with ``--resume``.
+(CPU) that the self-play trainers load with ``--resume``. Epoch ``round*``
+files are crash-recovery only; they are deleted once ``new`` is written.
 
-Run:  python distill.py --net gnn --data data.jsonl --graph-key 0 --outdir ../base/gnn
+Run:  python distill.py --data ../distill_data/m2_19x19.jsonl
 """
 from __future__ import annotations
 
@@ -56,7 +59,10 @@ import torch.nn as nn
 
 from graphs import get_builtin
 import gkt_cpp
-from gkt import progress_append  # noqa: E402
+from gkt import (  # noqa: E402
+    progress_append, VALUE_ABS_WEIGHT_DEFAULT, VALUE_RTO_WEIGHT_DEFAULT,
+    VALUE_CONS_WEIGHT_DEFAULT, value_cons_scale, set_value_loss_attrs,
+)
 from gkt_gpu import (  # noqa: E402
     make_net, save_net, _masked_ce, _permute_adj_batch,
     gpu_net_finite, gpu_net_type, gpu_net_label,
@@ -67,12 +73,80 @@ from gkt_cpu import (  # noqa: E402
 from grid_sym import augment_vertex_batch, augment_graph_batch  # noqa: E402
 
 GPU_NETS = ("gnn", "2dcnn")
+DISTILL_OUTDIR = {
+    "gnn": "../base/gnn",
+    "2dcnn": "../base/cnn2d",
+    "mlp": "../base/mlp",
+    "1dcnn": "../base/cnn1d",
+}
 DISTILL_STAGES = ("policy", "own", "value")
 STAGE_LR_MULT = {"policy": 1.0, "own": 25.0, "value": 100.0}
 
 
+def _empty_board(rec) -> bool:
+    board = rec.get("board")
+    if not board:
+        return False
+    return all(int(c) == 0 for c in board)
+
+
+def game_groups(records):
+    """Index lists, one per game. Prefer ``game_id``; else empty-board starts."""
+    n = len(records)
+    if n == 0:
+        return []
+    if all(r.get("game_id") is not None for r in records):
+        buckets = {}
+        order = []
+        for i, rec in enumerate(records):
+            gid = rec["game_id"]
+            if gid not in buckets:
+                buckets[gid] = []
+                order.append(gid)
+            buckets[gid].append(i)
+        return [buckets[g] for g in order]
+    groups = []
+    start = 0
+    for i, rec in enumerate(records):
+        if i > 0 and _empty_board(rec):
+            groups.append(list(range(start, i)))
+            start = i
+    groups.append(list(range(start, n)))
+    return groups
+
+
+def split_val_by_game(records, val_frac, seed):
+    """Hold out a random ``val_frac`` of *games* (complete games, fixed seed).
+
+    Prefix-of-file splits put early/calm games in val. Shuffling games with
+    ``seed`` keeps the split reproducible without that bias. Never splits a
+    game across train/val. Leaves at least one game in train when possible.
+    """
+    groups = game_groups(records)
+    n_g = len(groups)
+    n = len(records)
+    if n == 0:
+        return [], [], 0, 0
+    if n_g <= 1:
+        n_val = max(1, int(n * float(val_frac)))
+        if n_val >= n:
+            n_val = max(0, n - 1)
+        return list(range(n_val, n)), list(range(n_val)), n_g, (1 if n_val else 0)
+    rng = random.Random(int(seed))
+    order = list(range(n_g))
+    rng.shuffle(order)
+    n_val_g = max(1, int(n_g * float(val_frac)))
+    if n_val_g >= n_g:
+        n_val_g = n_g - 1
+    val_g = set(order[:n_val_g])
+    val_idx, train_idx = [], []
+    for gi, idxs in enumerate(groups):
+        (val_idx if gi in val_g else train_idx).extend(idxs)
+    return train_idx, val_idx, n_g, n_val_g
+
+
 def build_sample(rec, graph, ng, native):
-    """One JSONL record -> the 12-tuple sample the GNN expects.
+    """One JSONL record -> the 13-tuple sample the nets expect.
 
     Feature vectors are computed by the *native engine* (``extract_features``)
     so distillation uses exactly the same F=8 graph-agnostic encoding as
@@ -105,10 +179,11 @@ def build_sample(rec, graph, ng, native):
     if s > 0:
         pol = pol / s
 
-    # KataGo scoreLead (mover-perspective points) -> score_lead = (my-opp)/n.
-    # KataGo "points" ~ stone-count lead here, so /n lands in [-1, 1] and
-    # matches the self-play value target's scale exactly.
-    value = float(np.clip(float(rec["scoreLead"]) / max(n, 1), -1.0, 1.0))
+    # Abs head: KataGo scoreLead in stones (same type as self-play MC lead_abs).
+    # Rto head: /n in [-1, 1] for search (same type as mix / Arena / JIT value).
+    score_lead_raw = float(rec["scoreLead"])
+    value_abs = score_lead_raw
+    value_rto = float(np.clip(score_lead_raw / max(n, 1), -1.0, 1.0))
 
     # KataGo ownership is black-relative [-1, 1]; self-play own is
     # mover-relative (mine - (rest - mine)). Flip sign when white to move.
@@ -118,15 +193,16 @@ def build_sample(rec, graph, ng, native):
     own = own * (1.0 if me == 1 else -1.0)
 
     # Aux targets: no trustworthy KataGo signal, so neutral values. Distill
-    # (GPU and CPU) trains only policy / value / own; aux stays at init.
-    q = value
+    # trains policy / both value heads / own; aux stays at init.
+    q = value_rto
     opp = np.zeros(n + 1, dtype=np.float32)
     opp_w = 0.0
     future = own.copy()
-    lead = value
+    lead = value_rto
     weight = 1.0
 
-    return (X, mask, pol, me, value, own, q, opp, opp_w, future, lead, weight)
+    return (X, mask, pol, me, value_abs, own, q, opp, opp_w, future, lead,
+            weight, value_rto)
 
 
 def build_batch(records, graph, ng, native):
@@ -136,16 +212,19 @@ def build_batch(records, graph, ng, native):
     so the full dataset's feature tensors are never materialized in memory —
     only the lightweight JSON records stay resident.
     """
-    xs, ms, ps, vs, os_ = [], [], [], [], []
+    xs, ms, ps, vs, os_, vrs = [], [], [], [], [], []
     for rec in records:
-        X, mask, pol, _me, value, own = build_sample(rec, graph, ng, native)[:6]
+        samp = build_sample(rec, graph, ng, native)
+        X, mask, pol, _me, value, own = samp[:6]
         xs.append(X)
         ms.append(mask)
         ps.append(pol)
         vs.append(value)
         os_.append(own)
+        vrs.append(float(samp[12]))
     return (np.stack(xs), np.stack(ms), np.stack(ps),
-            np.asarray(vs, dtype=np.float32), np.stack(os_))
+            np.asarray(vs, dtype=np.float32), np.stack(os_),
+            np.asarray(vrs, dtype=np.float32))
 
 
 def _aug_train_batch(net, graph, X, mask, pol, own, enabled=True):
@@ -174,18 +253,23 @@ def _aug_train_batch(net, graph, X, mask, pol, own, enabled=True):
 
 
 def distill_train_on_batch(net, X, mask, policy, value, own,
-                           stage="policy", adj_in=None, adj_out=None):
+                           stage="policy", adj_in=None, adj_out=None,
+                           value_rto=None):
     """One supervised Adam step on a single distill stage (GPU).
 
-    All three losses are computed for the log. Stage 1 (``policy``) backprops
-    ``pl + value_weight*vl + own_weight*ol`` through every parameter. Own /
-    value stages backprop one unweighted head with the trunk frozen.
+    Reported ``vl`` is abs (stone) MSE. Stage 1 backprops
+    ``pl + vw*abs + vr*rto + wc*cons + ow*own``. Own stage: unweighted own,
+    trunk frozen. Value stage: both value heads + cons, trunk frozen.
     """
+    if value_rto is None:
+        raise ValueError("distill requires value_rto")
     X_t = torch.from_numpy(np.asarray(X, np.float32)).float().to(net.device)
     m_t = torch.from_numpy(np.asarray(mask) > 0).bool().to(net.device)
     p_t = torch.from_numpy(np.asarray(policy, np.float32)).float().to(net.device)
     v_t = torch.from_numpy(np.asarray(value, np.float32)).float().to(net.device)
     o_t = torch.from_numpy(np.asarray(own, np.float32)).float().to(net.device)
+    rto_t = torch.from_numpy(np.asarray(value_rto, np.float32)).float().to(
+        net.device).reshape(-1)
 
     if stage == "policy":
         net.train()
@@ -196,16 +280,24 @@ def distill_train_on_batch(net, X, mask, policy, value, own,
     else:
         out = net.forward(X_t)
     policy_loss = _masked_ce(out["policy"], p_t, m_t).mean()
-    value_loss = (out["value"].squeeze(-1) - v_t).pow(2).mean()
+    abs_loss = (out["value_abs"].squeeze(-1) - v_t).pow(2).mean()
+    rto_loss = (out["value"].squeeze(-1) - rto_t).pow(2).mean()
     own_loss = (out["own"] - o_t).pow(2).mean(dim=-1).mean()
+    n_verts = int(X_t.shape[1])
+    scale = value_cons_scale(n_verts, getattr(net, "value_cons_mul_n", True))
+    cons_loss = (out["value_abs"].squeeze(-1)
+                 - scale * out["value"].squeeze(-1)).pow(2).mean()
     vw = float(getattr(net, "value_weight", 1.0))
+    vr = float(getattr(net, "value_rto_weight", 1.0))
     ow = float(getattr(net, "own_weight", 1.0))
+    wc = float(getattr(net, "value_cons_weight", 0.0))
     if stage == "policy":
-        loss = policy_loss + vw * value_loss + ow * own_loss
+        loss = (policy_loss + vw * abs_loss + vr * rto_loss
+                + wc * cons_loss + ow * own_loss)
     elif stage == "own":
         loss = own_loss
     elif stage == "value":
-        loss = value_loss
+        loss = vw * abs_loss + vr * rto_loss + wc * cons_loss
     else:
         raise ValueError(f"unknown distill stage {stage!r}")
 
@@ -218,7 +310,7 @@ def distill_train_on_batch(net, X, mask, policy, value, own,
         nn.utils.clip_grad_norm_(trainable, 1.0)
     net.optimizer.step()
     return tuple(float(x.detach().item())
-                 for x in (policy_loss, value_loss, own_loss, loss))
+                 for x in (policy_loss, abs_loss, own_loss, loss))
 
 
 @torch.no_grad()
@@ -231,7 +323,7 @@ def eval_batch(net, X, mask, policy, value, own):
     net.eval()
     out = net.forward(X_t)
     pl = _masked_ce(out["policy"], p_t, m_t).mean()
-    vl = (out["value"].squeeze(-1) - v_t).pow(2).mean()
+    vl = (out["value_abs"].squeeze(-1) - v_t).pow(2).mean()
     ol = (out["own"] - o_t).pow(2).mean(dim=-1).mean()
     return float(pl.item()), float(vl.item()), float(ol.item())
 
@@ -299,6 +391,8 @@ def _latest_round(outdir, ext):
     best, best_path = 0, None
     if os.path.isdir(outdir):
         for name in os.listdir(outdir):
+            if name.endswith(".adam.npz"):
+                continue
             if name.startswith("round") and name.endswith(ext):
                 stem = name[len("round"):-len(ext)]
                 if stem.isdigit():
@@ -306,6 +400,36 @@ def _latest_round(outdir, ext):
                     if n > best:
                         best, best_path = n, os.path.join(outdir, name)
     return best, best_path
+
+
+def _is_epoch_snapshot(name: str) -> bool:
+    """``round12.pt`` / ``round3.npz`` / ``round3.adam.npz`` (not ``new``)."""
+    if not name.startswith("round"):
+        return False
+    body = name[len("round"):]
+    if body.endswith(".adam.npz"):
+        return body[:-len(".adam.npz")].isdigit()
+    root, ext = os.path.splitext(body)
+    return ext in (".pt", ".npz") and root.isdigit()
+
+
+def _prune_distill_rounds(outdir: str) -> int:
+    """Delete epoch snapshots after ``new`` is written. Crash resume only."""
+    if not os.path.isdir(outdir):
+        return 0
+    n = 0
+    for name in os.listdir(outdir):
+        if not _is_epoch_snapshot(name):
+            continue
+        path = os.path.join(outdir, name)
+        try:
+            os.remove(path)
+            n += 1
+        except OSError as e:
+            print(f"[distill] could not remove {path}: {e}")
+    if n:
+        print(f"[distill] removed {n} epoch snapshot(s) under {outdir}")
+    return n
 
 
 def _total_epochs(stage_epochs):
@@ -338,7 +462,11 @@ def _aug_on(epoch, aug_from_epoch):
 def _hb_extra(lr, do_aug, stage, args):
     extra = f"lr={lr:g} aug={'on' if do_aug else 'off'}"
     if stage == "policy":
-        extra += f" vw={args.value_weight:g} ow={args.own_weight:g}"
+        extra += (f" vw={args.value_weight:g} vr={args.value_rto_weight:g} "
+                  f"wc={args.value_cons_weight:g} ow={args.own_weight:g}")
+    elif stage == "value":
+        extra += (f" vw={args.value_weight:g} vr={args.value_rto_weight:g} "
+                  f"wc={args.value_cons_weight:g}")
     return extra
 
 
@@ -347,7 +475,7 @@ def _gpu_stage_prefixes(_net, stage):
     if stage == "policy":
         return None
     own = ("own_head",)
-    value = ("value_attn", "value_fc1", "value_fc2")
+    value = ("value_attn", "value_fc1", "value_fc2", "value_abs_head")
     if stage == "own":
         return own
     if stage == "value":
@@ -373,7 +501,9 @@ def _enter_gpu_stage(net, stage, base_lr):
     n_param = sum(p.numel() for p in trainable)
     extra = ""
     if stage == "policy":
-        extra = (f" joint P+{float(getattr(net, 'value_weight', 1.0)):g}V"
+        extra = (f" joint P+{float(getattr(net, 'value_weight', 1.0)):g}Vabs"
+                 f"+{float(getattr(net, 'value_rto_weight', 1.0)):g}Vrto"
+                 f"+{float(getattr(net, 'value_cons_weight', 0.0)):g}cons"
                  f"+{float(getattr(net, 'own_weight', 1.0)):g}O, no freeze")
     else:
         extra = " head only, trunk frozen"
@@ -408,7 +538,9 @@ def _enter_cpu_stage(net, stage, base_lr):
     net.lr = lr
     net._distill_opt = NumpyAdam(lr)
     if stage == "policy":
-        extra = (f"joint P+{float(getattr(net, 'value_weight', 1.0)):g}V"
+        extra = (f"joint P+{float(getattr(net, 'value_weight', 1.0)):g}Vabs"
+                 f"+{float(getattr(net, 'value_rto_weight', 1.0)):g}Vrto"
+                 f"+{float(getattr(net, 'value_cons_weight', 0.0)):g}cons"
                  f"+{float(getattr(net, 'own_weight', 1.0)):g}O, no freeze")
     else:
         extra = "head only, trunk frozen"
@@ -455,6 +587,7 @@ def _train_gpu(net, args, records, train_idx, val_idx, graph, ng, native,
         save_net(net, out)
         print(f"[distill] already finished {total} epochs "
               f"(latest checkpoint is epoch {start_epoch - 1}); saved {out}")
+        _prune_distill_rounds(args.outdir)
         return out
     current_stage = None
     for epoch in range(start_epoch, total + 1):
@@ -485,12 +618,12 @@ def _train_gpu(net, args, records, train_idx, val_idx, graph, ng, native,
         pl_s = vl_s = ol_s = 0.0
         steps = 0
         for i, batch_idx in enumerate(_batched(train_idx, args.batch_size), 1):
-            X, mask, pol, val, own = run_batch(batch_idx)
+            X, mask, pol, val, own, val_rto = run_batch(batch_idx)
             X, mask, pol, own, adj_in, adj_out = _aug_train_batch(
                 net, graph, X, mask, pol, own, enabled=do_aug)
             pl, vl, ol, _loss = distill_train_on_batch(
                 net, X, mask, pol, val, own, stage=stage,
-                adj_in=adj_in, adj_out=adj_out)
+                adj_in=adj_in, adj_out=adj_out, value_rto=val_rto)
             hb.step("train", i, n_tr, len(batch_idx), pl, vl, ol)
             if math.isfinite(pl):
                 pl_s += pl
@@ -506,7 +639,7 @@ def _train_gpu(net, args, records, train_idx, val_idx, graph, ng, native,
         vpl = vvl = vol = 0.0
         hb.line(f"val_start steps={n_va}", fsync=True)
         for i, batch_idx in enumerate(_batched(val_idx, args.batch_size), 1):
-            X, mask, pol, val, own = run_batch(batch_idx)
+            X, mask, pol, val, own, _vr = run_batch(batch_idx)
             p, v, o = eval_batch(net, X, mask, pol, val, own)
             hb.step("val", i, n_va, len(batch_idx), p, v, o)
             vpl += p
@@ -528,6 +661,7 @@ def _train_gpu(net, args, records, train_idx, val_idx, graph, ng, native,
     out = os.path.join(args.outdir, "new.pt")
     save_net(net, out)
     print(f"[distill] saved {out}")
+    _prune_distill_rounds(args.outdir)
     return out
 
 
@@ -547,6 +681,7 @@ def _train_cpu(net, args, records, train_idx, val_idx, graph, ng, native,
         save_cpu_net(net, out)
         print(f"[distill] already finished {total} epochs "
               f"(latest checkpoint is epoch {start_epoch - 1}); saved {out}")
+        _prune_distill_rounds(args.outdir)
         return out
     current_stage = None
     for epoch in range(start_epoch, total + 1):
@@ -574,11 +709,11 @@ def _train_cpu(net, args, records, train_idx, val_idx, graph, ng, native,
         pl_s = vl_s = ol_s = 0.0
         steps = 0
         for i, batch_idx in enumerate(_batched(train_idx, args.batch_size), 1):
-            X, mask, pol, val, own = run_batch(batch_idx)
+            X, mask, pol, val, own, val_rto = run_batch(batch_idx)
             X, mask, pol, own, _, _ = _aug_train_batch(
                 net, graph, X, mask, pol, own, enabled=do_aug)
             pl, vl, ol, _loss = net.distill_train_on_batch(
-                X, mask, pol, val, own, stage=stage)
+                X, mask, pol, val, own, stage=stage, value_rto=val_rto)
             hb.step("train", i, n_tr, len(batch_idx), pl, vl, ol)
             if math.isfinite(pl):
                 pl_s += pl
@@ -594,7 +729,7 @@ def _train_cpu(net, args, records, train_idx, val_idx, graph, ng, native,
         vpl = vvl = vol = 0.0
         hb.line(f"val_start steps={n_va}", fsync=True)
         for i, batch_idx in enumerate(_batched(val_idx, args.batch_size), 1):
-            X, mask, pol, val, own = run_batch(batch_idx)
+            X, mask, pol, val, own, _vr = run_batch(batch_idx)
             p, v, o = net.distill_eval_batch(X, mask, pol, val, own)
             hb.step("val", i, n_va, len(batch_idx), p, v, o)
             vpl += p
@@ -617,6 +752,7 @@ def _train_cpu(net, args, records, train_idx, val_idx, graph, ng, native,
     out = os.path.join(args.outdir, "new.npz")
     save_cpu_net(net, out)
     print(f"[distill] saved {out}")
+    _prune_distill_rounds(args.outdir)
     return out
 
 
@@ -625,11 +761,12 @@ def main():
     ap.add_argument("--net", default="gnn",
                     choices=["gnn", "2dcnn", "mlp", "1dcnn"],
                     help="student architecture (gnn/2dcnn = GPU, mlp/1dcnn = CPU)")
-    ap.add_argument("--data", default=None,
+    ap.add_argument("--data", default="../distill_data/m2_19x19.jsonl",
                     help="JSONL of analyzed positions (gkt vertex order)")
     ap.add_argument("--graph-key", default="0",
                     help="builtin graph key ('0'=19x19, '0.5'=7x7)")
-    ap.add_argument("--outdir", default="../base/gnn")
+    ap.add_argument("--outdir", default=None,
+                    help="default ../base/<arch> from --net")
     ap.add_argument("--hidden", type=int, default=512)
     ap.add_argument("--n-blocks", type=int, default=20)
     ap.add_argument("--kernel-size", type=int, default=3,
@@ -640,25 +777,37 @@ def main():
     ap.add_argument("--attn-heads", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=10,
                     help="epochs per stage (3 stages: policy, own, value)")
-    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="default 16 for gnn/2dcnn (19x19 VRAM), 64 for mlp/1dcnn")
     ap.add_argument("--lr", type=float, default=1e-4,
                     help="base Adam lr for stage 1; own uses 25x, value 100x")
-    ap.add_argument("--val-frac", type=float, default=0.05)
+    ap.add_argument("--val-frac", type=float, default=0.05,
+                    help="fraction of games held out for val (not a file prefix); "
+                         "split is shuffled with --seed, whole games only")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--value-weight", type=float, default=30.0,
-                    help="stage-1 value MSE multiplier (own/value stages ignore this)")
+    ap.add_argument("--value-weight", type=float, default=VALUE_ABS_WEIGHT_DEFAULT,
+                    help="abs (stone-lead) MSE multiplier; reported vl is unweighted abs")
+    ap.add_argument("--value-rto-weight", type=float,
+                    default=VALUE_RTO_WEIGHT_DEFAULT,
+                    help="rto (scoreLead/n, search head) MSE multiplier")
+    ap.add_argument("--value-cons-weight", type=float,
+                    default=VALUE_CONS_WEIGHT_DEFAULT,
+                    help="(abs - n*rto)^2 coupling; very low so heads can still disagree")
     ap.add_argument("--own-weight", type=float, default=5.0,
                     help="stage-1 ownership MSE multiplier (own/value stages ignore this)")
     ap.add_argument("--aug-from-epoch", type=int, default=4,
                     help="1-based global epoch when train shuffle starts "
                          "(0=never, 1=from epoch 1). Default 4 = 3 identity epochs first")
-    ap.add_argument("--resume", action="store_true",
-                    help="resume from the latest round*.pt/.npz checkpoint in outdir")
+    ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                    help="resume from the latest round*.pt/.npz in outdir "
+                         "(default on; --no-resume starts epoch 1)")
     args = ap.parse_args()
 
-    if not args.data:
-        ap.error("need --data <file.jsonl>")
+    if args.outdir is None:
+        args.outdir = DISTILL_OUTDIR[args.net]
+    if args.batch_size is None:
+        args.batch_size = 16 if args.net in GPU_NETS else 64
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -681,11 +830,11 @@ def main():
         print("[distill] no records; abort")
         return
 
-    n_val = max(1, int(len(records) * args.val_frac))
-    val_idx = list(range(n_val))
-    train_idx = list(range(n_val, len(records)))
+    train_idx, val_idx, n_games, n_val_g = split_val_by_game(
+        records, args.val_frac, args.seed)
     print(f"[distill] train={len(train_idx)} val={len(val_idx)} "
-          f"(val = first {args.val_frac:.0%}, fixed order, no aug)")
+          f"({n_val_g}/{n_games} games, val-frac={args.val_frac:g}, "
+          f"seed={args.seed}, whole games, no aug on val)")
     af = int(args.aug_from_epoch)
     if af <= 0:
         print("[distill] train aug: OFF (identity numbering)")
@@ -698,13 +847,17 @@ def main():
         else:
             print(f"[distill] train aug: identity for epochs 1-{af - 1}, "
                   f"then {kind} from epoch {af}")
-    print(f"[distill] stages: joint P+{args.value_weight:g}V+{args.own_weight:g}O "
+    print(f"[distill] stages: joint P+{args.value_weight:g}Vabs"
+          f"+{args.value_rto_weight:g}Vrto+{args.value_cons_weight:g}cons"
+          f"+{args.own_weight:g}O "
           f"{args.epochs}ep @ lr={args.lr:g} (no freeze) → "
           f"own {args.epochs}ep @ lr={args.lr * 25:g} → "
-          f"value {args.epochs}ep @ lr={args.lr * 100:g} "
+          f"both value heads {args.epochs}ep @ lr={args.lr * 100:g} "
           f"(trunk frozen after stage 1)")
     print(f"[distill] value_weight={args.value_weight:g} "
-          f"own_weight={args.own_weight:g} (stage-1 loss only)")
+          f"value_rto_weight={args.value_rto_weight:g} "
+          f"value_cons_weight={args.value_cons_weight:g} "
+          f"own_weight={args.own_weight:g} (stage-1 and value-stage loss)")
 
     if args.net in GPU_NETS:
         device = args.device
@@ -714,11 +867,15 @@ def main():
                        n_blocks=args.n_blocks, graph=graph, device=device,
                        lr=args.lr, attn_layer=args.attn_layer, n_heads=args.attn_heads,
                        num_players=2, zero_value_heads=False,
-                       value_weight=args.value_weight, own_weight=args.own_weight)
+                       value_weight=args.value_weight, own_weight=args.own_weight,
+                       value_rto_weight=args.value_rto_weight,
+                       value_cons_weight=args.value_cons_weight, rules="go")
         print(f"[distill] net: {net.net_type} H={net.hidden_dim} "
               f"blocks={net.n_blocks} F={net.n_features} device={device}")
         start_epoch = 1
         resume_opt = resume_stage = None
+        skip_gpu = False
+        out = None
         if args.resume:
             last_epoch, path = _latest_round(args.outdir, ".pt")
             if path:
@@ -731,18 +888,28 @@ def main():
                       f"{', stage=' + str(resume_stage) if resume_stage else ''}); "
                       f"continuing at epoch {start_epoch}")
             else:
-                print(f"[distill] --resume set but no round*.pt in "
-                      f"{args.outdir}; starting at epoch 1")
-        out = _train_gpu(net, args, records, train_idx, val_idx, graph, ng,
-                         native, start_epoch, resume_opt=resume_opt,
-                         resume_stage=resume_stage)
+                done = os.path.join(args.outdir, "new.pt")
+                if os.path.isfile(done):
+                    print(f"[distill] --resume: {done} already exists "
+                          f"(no round*.pt); keeping it")
+                    skip_gpu = True
+                    out = done
+                else:
+                    print(f"[distill] --resume set but no round*.pt in "
+                          f"{args.outdir}; starting at epoch 1")
+        if not skip_gpu:
+            out = _train_gpu(net, args, records, train_idx, val_idx, graph, ng,
+                             native, start_epoch, resume_opt=resume_opt,
+                             resume_stage=resume_stage)
     else:
         if args.net == "mlp":
             net = MlpPolicyValueNet(n_features=None, hidden_dim=args.hidden,
                                     lr=args.lr, num_players=2,
                                     zero_value_heads=False,
                                     value_weight=args.value_weight,
-                                    own_weight=args.own_weight)
+                                    own_weight=args.own_weight,
+                                    value_rto_weight=args.value_rto_weight,
+                                    value_cons_weight=args.value_cons_weight)
         else:
             net = Cnn1dPolicyValueNet(n_features=None, hidden_dim=args.hidden,
                                       kernel_size=args.kernel_size,
@@ -750,10 +917,18 @@ def main():
                                       num_players=2,
                                       zero_value_heads=False,
                                       value_weight=args.value_weight,
-                                      own_weight=args.own_weight)
+                                      own_weight=args.own_weight,
+                                      value_rto_weight=args.value_rto_weight,
+                                      value_cons_weight=args.value_cons_weight)
+        set_value_loss_attrs(
+            net, value_weight=args.value_weight,
+            value_rto_weight=args.value_rto_weight, own_weight=args.own_weight,
+            value_cons_weight=args.value_cons_weight, rules="go")
         print(f"[distill] net: {args.net} H={net.H} F={net.F}")
         start_epoch = 1
         resume_adam = resume_stage = None
+        skip_cpu = False
+        out = None
         if args.resume:
             last_epoch, path = _latest_round(args.outdir, ".npz")
             if path:
@@ -768,11 +943,19 @@ def main():
                       f"{', stage=' + str(resume_stage) if resume_stage else ''}); "
                       f"continuing at epoch {start_epoch}")
             else:
-                print(f"[distill] --resume set but no round*.npz in "
-                      f"{args.outdir}; starting at epoch 1")
-        out = _train_cpu(net, args, records, train_idx, val_idx, graph, ng,
-                         native, start_epoch, resume_adam=resume_adam,
-                         resume_stage=resume_stage)
+                done = os.path.join(args.outdir, "new.npz")
+                if os.path.isfile(done):
+                    print(f"[distill] --resume: {done} already exists "
+                          f"(no round*.npz); keeping it")
+                    skip_cpu = True
+                    out = done
+                else:
+                    print(f"[distill] --resume set but no round*.npz in "
+                          f"{args.outdir}; starting at epoch 1")
+        if not skip_cpu:
+            out = _train_cpu(net, args, records, train_idx, val_idx, graph, ng,
+                             native, start_epoch, resume_adam=resume_adam,
+                             resume_stage=resume_stage)
 
     meta = os.path.join(args.outdir, "distill_meta.json")
     with open(meta, "w", encoding="utf-8") as f:
@@ -783,6 +966,8 @@ def main():
                    "stage_lr_mult": STAGE_LR_MULT,
                    "n_samples": len(records), "lr": args.lr,
                    "value_weight": args.value_weight,
+                   "value_rto_weight": args.value_rto_weight,
+                   "value_cons_weight": args.value_cons_weight,
                    "own_weight": args.own_weight}, f, indent=2)
     print(f"[distill] wrote {meta}")
 

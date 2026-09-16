@@ -63,6 +63,8 @@ MODEL_DIR = os.path.join(HERE, "_models")
 # browser does not POST a whole .pt.
 REPO_MODELS = os.path.abspath(os.path.join(HERE, "..", "..", "models"))
 SELFPLAY_BATCH = 64  # MCTS leaf batch; attention n×n caps VRAM around this
+MAX_JSON_BYTES = 1 * 1024 * 1024      # setup / load_model / human / advance
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024   # same cap as gkt_dist.py uploads
 
 # Session state (single-thread HTTPServer; no lock)
 STATE = {
@@ -569,6 +571,8 @@ def _state():
 # ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30
+
     def _send(self, code, obj):
         def _json_default(o):
             if isinstance(o, np.ndarray):
@@ -583,9 +587,37 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _content_length(self, cap, *, allow_zero=False):
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            self._send(411, {"error": "Content-Length required"})
+            return None
+        try:
+            n = int(raw)
+        except ValueError:
+            self._send(400, {"error": "bad Content-Length"})
+            return None
+        lo = 0 if allow_zero else 1
+        if n < lo or n > cap:
+            self._send(413, {"error": "body too large"})
+            return None
+        return n
+
     def _read_body(self):
-        n = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+        n = self._content_length(MAX_JSON_BYTES, allow_zero=True)
+        if n is None:
+            return None
+        if n == 0:
+            return {}
+        raw = self.rfile.read(n)
+        if len(raw) != n:
+            self._send(400, {"error": "truncated body"})
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send(400, {"error": "bad json"})
+            return None
 
     def _serve_html(self):
         p = os.path.join(HERE, "index.html")
@@ -601,8 +633,12 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_upload(self):
         q = parse_qs(urlparse(self.path).query)
         idx = int(q.get("player", ["0"])[0])
-        length = int(self.headers.get("Content-Length", 0))
+        length = self._content_length(MAX_UPLOAD_BYTES, allow_zero=False)
+        if length is None:
+            return
         data = self.rfile.read(length)
+        if len(data) != length:
+            return self._send(400, {"error": "truncated body"})
         name = unquote(self.headers.get("X-Filename", f"player_{idx}.pt"))
         ext = os.path.splitext(name)[1].lower() or ".pt"
         os.makedirs(MODEL_DIR, exist_ok=True)
@@ -667,6 +703,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/upload_model":
             return self._handle_upload()
         body = self._read_body()
+        if body is None:
+            return
         if path == "/api/load_model":
             return self._handle_load_named(body)
         if path == "/api/setup":

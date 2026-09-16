@@ -5,9 +5,13 @@ temperature-sampled moves, querying policy / scoreLead / ownership at each
 position. Every position is written as a distill JSONL record (gkt vertex
 order) that ``distill.py`` consumes directly.
 
-The board is reconstructed by replaying the same moves through the gkt native
-engine (``gkt_cpp``), so captures / superko match gkt's own rules exactly and
-the resulting ``board`` field is a correct gkt-order occupancy array.
+Moves are applied on the gkt native engine first; only a legal
+``MoveResult`` is appended to KataGo's ``moves`` list. Graph-Go game-over
+(elimination after a side's two consecutive turns of pass, or protocol
+end — all remaining sides have just passed) stops the game. Do not use
+KataGo tromp-taylor's "two consecutive plies of pass" as the only stop:
+that continues after a GKT elimination, then a rejected stone desyncs
+the two boards and poisons later labels.
 
 Usage:
   python gen_katago_data.py \
@@ -25,6 +29,7 @@ import os
 import random
 import subprocess
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -103,22 +108,36 @@ def main():
     ng = gkt_cpp.py_graph_to_native(graph)
 
     # Launch KataGo analysis engine.
+    # stderr must be drained: an unread PIPE fills (~4 KiB on Windows) and
+    # deadlocks the child while we block on stdout.readline().
     proc = subprocess.Popen(
         [args.katago, "analysis", "-config", args.config, "-model", args.model],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", bufsize=1)
 
+    def _drain_katago_stderr():
+        try:
+            for line in proc.stderr:
+                sys.stderr.write("[katago] " + line)
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain_katago_stderr, daemon=True).start()
+
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     outf = open(args.out, "w", encoding="utf-8")
 
     total_records = 0
+    n_illegal_stop = 0
     try:
         for g in range(args.games):
             game = native.Game(ng, 2, rules="go")
             gtp_moves = []          # KataGo query history: [["B","Q16"], ...]
             ply = 0
-            passes = 0
+            consecutive_passes = 0
             while ply < args.max_moves:
+                if game.game_over():
+                    break
                 board = list(game.position.occupancy)  # gkt order 0/1/2
                 to_move = int(game.position.to_move)
 
@@ -139,6 +158,7 @@ def main():
 
                 # --- write the distill record ---
                 rec = parse_analysis(resp, board, to_move, rows, cols)
+                rec["game_id"] = int(g)
                 outf.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 total_records += 1
 
@@ -147,17 +167,21 @@ def main():
                 gidx, gtp = _sample_move(resp.get("moveInfos", []), tau, rng,
                                          rows, cols)
 
-                # apply move to local engine + KataGo history
+                # GKT first; only a legal move may enter KataGo history.
+                r = game.play(gidx)
+                if not r.legal:
+                    n_illegal_stop += 1
+                    print(f"[gen] game {g + 1} ply {ply}: GKT rejected "
+                          f"{gtp} ({r.reason}); stop to keep boards in sync",
+                          flush=True)
+                    break
+                gtp_moves.append([("B" if to_move == 1 else "W"), gtp])
                 if gtp == "pass":
-                    gtp_moves.append([("B" if to_move == 1 else "W"), "pass"])
-                    game.play(n)
-                    passes += 1
-                    if passes >= 2:
+                    consecutive_passes += 1
+                    if consecutive_passes >= 2:
                         break
                 else:
-                    gtp_moves.append([("B" if to_move == 1 else "W"), gtp])
-                    game.play(gidx)
-                    passes = 0
+                    consecutive_passes = 0
                 ply += 1
 
             if g % 10 == 0 or g == args.games - 1:
@@ -172,7 +196,8 @@ def main():
         except Exception:
             proc.kill()
 
-    print(f"[gen] done: {total_records} records -> {args.out}")
+    print(f"[gen] done: {total_records} records -> {args.out}"
+          f" (illegal-stop games={n_illegal_stop})")
 
 
 if __name__ == "__main__":

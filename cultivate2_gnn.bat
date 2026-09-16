@@ -53,7 +53,7 @@ if exist "%~dp0cultivate2\gnn\new.pt" (
 )
 
 cd /d "%~dp0..\scr"
-"%PY%" gkt_train_gpu.py --net gnn --hidden 512 --n-blocks 20 --device cuda --selfplay-device cuda --graphs 0 --rounds 20 --freeze-policy-until-round 10 --value-weight 30 --own-weight 5 --q-lambda 0.5 --lr 1e-4 --temperature 0.1 --sim 256 --workers 1 --gpw 32 --steps 16 --no-arena --buffer-drop-from-round 21 --model-snapshot-rounds 25 --outdir ../base/cultivate2/gnn --resume !RESUME!
+"%PY%" gkt_train_gpu.py --graphs 0 --rounds 20 --freeze-policy-until-round 10 --no-arena --buffer-drop-from-round 21 --model-snapshot-rounds 25 --outdir ../base/cultivate2/gnn --resume !RESUME!
 
 echo.
 echo cultivate2 done. Model: base\cultivate2\gnn\new.pt

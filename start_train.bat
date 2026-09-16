@@ -35,7 +35,6 @@ set "KINDDIR=gnn"
 set "CKPT=new.pt"
 set "TRAINER=gkt_train_gpu.py"
 set "NET=gnn"
-set "EXTRA=--device cuda --selfplay-device cuda"
 goto :dispatch
 
 :mlp
@@ -43,7 +42,6 @@ set "KINDDIR=mlp"
 set "CKPT=new.npz"
 set "TRAINER=gkt_train_cpu.py"
 set "NET=mlp"
-set "EXTRA="
 goto :dispatch
 
 :cnn1d
@@ -51,7 +49,6 @@ set "KINDDIR=cnn1d"
 set "CKPT=new.npz"
 set "TRAINER=gkt_train_cpu.py"
 set "NET=1dcnn"
-set "EXTRA="
 goto :dispatch
 
 :cnn2d
@@ -59,7 +56,6 @@ set "KINDDIR=cnn2d"
 set "CKPT=new.pt"
 set "TRAINER=gkt_train_gpu.py"
 set "NET=2dcnn"
-set "EXTRA=--device cuda --selfplay-device cuda"
 goto :dispatch
 
 :dispatch
@@ -88,9 +84,9 @@ if /i "%RULES%"=="antigomoku" (
   set "MODDIR=cur_mod_!KINDDIR!"
 )
 
-REM Optional override for experiments (M0/M1/M2): GKT_OUTDIR is relative
-REM to the project root (this bat folder). It overrides MODDIR and
-REM forwards an explicit --outdir (relative to scr/) to the trainer.
+REM Optional override: GKT_OUTDIR is relative to the project root
+REM (this bat folder). It overrides MODDIR and forwards an explicit
+REM --outdir (relative to scr/) to the trainer.
 if defined GKT_OUTDIR (
   set "MODDIR=!GKT_OUTDIR!"
   set "OUTDIR_ARG=--outdir ../!GKT_OUTDIR!"
@@ -119,7 +115,7 @@ echo Ctrl+C stops training. Next launch resumes if %CKPT% exists.
 echo.
 
 cd /d "%~dp0scr"
-"%PY%" %TRAINER% --net %NET% %EXTRA% !OUTDIR_ARG! !RESUME! !REST!
+"%PY%" %TRAINER% --net %NET% !OUTDIR_ARG! !RESUME! --infinite !REST!
 echo.
 echo Training exited.
 pause

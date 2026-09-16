@@ -246,7 +246,7 @@
       <button id="btnStart">开始对局</button>
       <p id="hintGo" class="hint">每位选手可设「真人」或「模型」。checkpoint 须与本局人数一致才可挂载。
         若仓库有 elo.json，下拉里会显示 Elo（仅展示，不参与训练筛选）。
-        模型席位跑恰好 sim 次 MCTS（根 Dirichlet 与训练相同；每次搜索按网络分派顶点重编号——GNN/MLP/1DCNN 随机重编号、2DCNN 走棋盘对称；走子仍取访问最多的一手）。无匹配权重时只能随机，sim 禁用。
+        模型席位跑恰好 sim 次 MCTS（根 Dirichlet 为 0，与 Arena/Elo 相同，不加训练自对弈的 0.25；每次搜索按网络分派顶点重编号——GNN/MLP/1DCNN 随机重编号、2DCNN 走棋盘对称；走子仍取访问最多的一手）。无匹配权重时只能随机，sim 禁用。
         贴目为该选手「从分中减」的数值，末位固定 0。规则贴目是先手 7.5（只扣先手）。</p>
       <p id="hintGomoku" class="hint" hidden>两人、无虚手、无贴目。连珠长度 k 只用于规则判胜，不写进图的边。
         只列出矩形网格（G19 / G7 / G9 / G15 / G7d / G9d 等）。checkpoint 须为 2P。</p>

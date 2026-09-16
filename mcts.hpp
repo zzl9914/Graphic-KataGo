@@ -99,5 +99,6 @@ private:
 };
 
 float score_lead(float my, float total, int n, int num_players);
+float score_lead_abs(float my, float total, int num_players);
 
 }  // namespace gkt
